@@ -244,3 +244,15 @@ tag-mapping.json
 
 # Custom BYOD build rayci yaml file
 .buildkite/release/custom_byod_build.rayci.yml
+
+# agents related
+.claude/
+.codex
+.develop-review-loop/
+
+# sensitive data
+.env
+
+# logs
+*.log
+
