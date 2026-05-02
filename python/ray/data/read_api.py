@@ -3906,6 +3906,11 @@ def read_lance(
     filter: Optional[str] = None,
     storage_options: Optional[Dict[str, str]] = None,
     scanner_options: Optional[Dict[str, Any]] = None,
+    hybrid_cache_l1_bytes: Optional[int] = None,
+    hybrid_cache_l2_dir: Optional[str] = None,
+    hybrid_cache_l2_bytes: Optional[int] = None,
+    hybrid_cache_codecless_bytes: Optional[int] = None,
+    hybrid_cache_l2_block_size_bytes: Optional[int] = None,
     ray_remote_args: Optional[Dict[str, Any]] = None,
     num_cpus: Optional[float] = None,
     num_gpus: Optional[float] = None,
@@ -3942,6 +3947,42 @@ def read_lance(
             method, such as `batch_size`. For more information,
             see `LanceDB API doc <https://lancedb.github.io\
             /lance-python-doc/all-modules.html#lance.LanceDataset.scanner>`_
+        hybrid_cache_l1_bytes: DRAM budget per worker for Lance's two-tier
+            (DRAM + NVMe) hybrid index cache. Required together with
+            ``hybrid_cache_l2_dir`` and ``hybrid_cache_l2_bytes``; leave all three
+            unset to use the default in-memory cache. By default, this is the
+            combined DRAM cap that Lance splits 90/10 between the foyer L1 tier
+            (which holds codec-bearing entries — IVF_RQ / IVF_PQ / IVF_SQ
+            partition payloads — and fronts them on their way to L2) and the
+            codec-less embedded Moka (which serves codec-less metadata such as
+            top-level vector / scalar index objects, scalar index pages, and
+            legacy IVF v1 entries). When ``hybrid_cache_codecless_bytes`` is
+            also set, this becomes the foyer L1 budget specifically.
+        hybrid_cache_l2_dir: Local NVMe directory used as the L2 tier. Each Ray
+            worker pins a unique subdirectory ``<l2_dir>/worker-<id>-<pid>`` so
+            that foyer's per-directory exclusive lock is not contended. Operators
+            must size NVMe to fit the per-worker budget multiplied by the number
+            of workers expected on the node.
+        hybrid_cache_l2_bytes: NVMe budget per worker for the L2 tier. With the
+            default 256 MiB foyer block size this must be at least 1 GiB (four
+            blocks). Override the block size via ``hybrid_cache_l2_block_size_bytes``
+            to use smaller L2 budgets.
+        hybrid_cache_codecless_bytes: When set, switches to Lance's deferred-codec
+            mode (``Session.with_hybrid_cache_advanced``). The foyer DRAM tier
+            (``hybrid_cache_l1_bytes``) and the codec-less embedded Moka
+            (this parameter) are sized independently — the codec only runs on
+            the foyer L1↔L2 boundary, never on warm L1 hits or codec-less
+            entries. Use this to override Lance's default 90/10 foyer/Moka
+            split when the codec-less working set (top-level index objects,
+            scalar index pages, legacy IVF v1 entries, …) needs a different
+            reserve than the 10% default — either more headroom for
+            metadata-heavy workloads or less so essentially all DRAM sits in
+            foyer L1. Requires a pylance build with
+            ``Session.with_hybrid_cache_advanced``.
+        hybrid_cache_l2_block_size_bytes: Override foyer's L2 block size (default
+            256 MiB). Only effective in deferred-codec mode (alongside
+            ``hybrid_cache_codecless_bytes``); use it to fit smaller L2 budgets,
+            e.g. 4 MiB blocks let a 16 MiB L2 satisfy foyer's four-block minimum.
         ray_remote_args: kwargs passed to :func:`ray.remote` in the read tasks.
         num_cpus: The number of CPUs to reserve for each parallel read worker.
         num_gpus: The number of GPUs to reserve for each parallel read worker. For
@@ -3967,6 +4008,11 @@ def read_lance(
         filter=filter,
         storage_options=storage_options,
         scanner_options=scanner_options,
+        hybrid_cache_l1_bytes=hybrid_cache_l1_bytes,
+        hybrid_cache_l2_dir=hybrid_cache_l2_dir,
+        hybrid_cache_l2_bytes=hybrid_cache_l2_bytes,
+        hybrid_cache_codecless_bytes=hybrid_cache_codecless_bytes,
+        hybrid_cache_l2_block_size_bytes=hybrid_cache_l2_block_size_bytes,
     )
 
     return read_datasource(
