@@ -1,0 +1,11 @@
+# pylance is installed separately from $HOME/git/lance-open-source/python.
+# On branches where `python/Cargo.toml` enables `hybrid-cache` on the `lance`
+# dep (e.g. `private-cache-4.0` >= 196f5dae), the feature is baked in and a
+# plain editable install is sufficient:
+#   pip install -e "$HOME/git/lance-open-source/python"
+ray[default]>=2.40
+lance-namespace>=0.5.2
+numpy>=1.26
+pyarrow>=15
+matplotlib>=3.8
+pandas>=2.2
