@@ -257,6 +257,37 @@ class HybridSearchActor:
         snap["actor_id"] = self._actor_id
         return snap
 
+    def check_l2_residency(
+        self,
+        l2_dir: "str | None",
+        owned_partitions: List[int],
+        label: str = "residency",
+    ) -> Dict[str, Any]:
+        """Walk the actor-local L2 dir and report per-actor residency.
+
+        Runs on the actor process so the directory walk hits the actor
+        node's local NVMe — driver-side walks would see an empty path
+        in any real-cluster topology where the L2 dirs are not on the
+        head node's filesystem. Returns the v6 aggregate-only schema
+        defined in ``check_l2_residency.compute_l2_residency`` (see
+        that module's docstring for the per-row field list).
+
+        ``l2_dir`` may be ``None`` for non-hybrid scenarios; the row
+        then carries zero L2 bytes / files and every owned partition
+        lands in ``missing``. ``l1_size_bytes_at_probe`` is filled from
+        ``Session.size_bytes()`` regardless.
+        """
+        from check_l2_residency import compute_l2_residency
+
+        l1_size = int(self._size_bytes_stats(self._sess).get("size_bytes", -1))
+        return compute_l2_residency(
+            actor_id=self._actor_id,
+            label=label,
+            owned_partitions=owned_partitions,
+            l2_dir=l2_dir,
+            l1_size_bytes=l1_size,
+        )
+
     def warmup_natural(
         self, queries: List[List[float]], k: int = 10
     ) -> Dict[str, Any]:

@@ -62,7 +62,13 @@ from typing import Any, Dict, List
 import numpy as np
 import ray
 
-from scenarios import GIB, MIB, build_scenario_spec, build_scenario_specs  # noqa: F401
+from scenarios import (  # noqa: F401
+    GIB,
+    MIB,
+    build_scenario_spec,
+    build_scenario_specs,
+    is_eligible_for_residency_probe,
+)
 
 HERE = Path(__file__).resolve().parent
 
@@ -74,9 +80,10 @@ from _hybrid_cache_helpers import (  # noqa: E402
     percentiles,
 )
 
-from check_partition_residency import (  # noqa: E402
+from check_l2_residency import (  # noqa: E402
     DEFAULT_NAMESPACE,
-    run_residency_check,
+    L1_SIZE_UNKNOWN,
+    run_l2_residency_check,
     write_residency_jsonl,
 )
 from distributed_actor import CoordinatorActor, HybridSearchActor  # noqa: E402
@@ -114,27 +121,27 @@ def _post_prewarm_l1_baseline(
     prewarm: str,
     num_actors: int,
     pre_measure_residency: List[Dict[str, Any]],
-) -> tuple[Dict[int, set[int]], str | None]:
-    """Return the L1 baseline used by the post-measure shift report.
+) -> tuple[Dict[int, int], str | None]:
+    """Return the per-actor L1 ``size_bytes`` baseline for the shift report.
 
-    The preferred baseline is the optional post-prewarm residency probe. For
-    hybrid sharded prewarm, we can still report movement without running that
-    probe: ``hybrid_tiered`` is validated above to admit zero vector partitions
-    into L1, so the post-prewarm L1 set is empty by construction.
+    Aggregate-only under v6: the v4 per-partition L1 sets are gone (the
+    no-load probe API ``prewarm_vector_cache(..., ram_bytes=0)`` has no
+    Lance 6.0 equivalent). The preferred baseline is the optional
+    post-prewarm residency probe's ``l1_size_bytes_at_probe``. For
+    hybrid ``sharded`` prewarm we can still report movement without
+    running that probe: ``hybrid_tiered`` admits zero vector partitions
+    into L1, so the L1 byte baseline is 0 by construction.
     """
     if pre_measure_residency:
         observed = {
-            int(r["actor_id"]): set(int(p) for p in r["in_l1"])
+            int(r["actor_id"]): int(r.get("l1_size_bytes_at_probe", L1_SIZE_UNKNOWN))
             for r in pre_measure_residency
         }
-        return (
-            observed,
-            "observed by post-prewarm probe",
-        )
+        return (observed, "observed by post-prewarm probe")
     if prewarm == "sharded" and scenario == "distributed":
         return (
-            {i: set() for i in range(num_actors)},
-            "inferred empty from hybrid_tiered prewarm",
+            dict.fromkeys(range(num_actors), 0),
+            "inferred zero from hybrid_tiered prewarm",
         )
     return {}, None
 
@@ -575,7 +582,7 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # Explicit namespace so check_partition_residency.py — which starts a
+    # Explicit namespace so check_l2_residency.py — which starts a
     # separate Ray job — can resolve our named actors via ray.get_actor().
     # Without this the driver lands in the job's anonymous namespace and
     # ray.get_actor() from another shell looks in a different one, so the
@@ -628,7 +635,20 @@ def main() -> int:
     t_start = time.time()
 
     # ── Phase 1: prewarm ──
+    # ``partitions_for_actor`` is the per-actor "expected" partition set
+    # consumed by the post-prewarm / post-measure residency probe. It is
+    # defined up-front so the probe works under any prewarm mode that
+    # has a well-defined expected set:
+    #   * forced: every actor caches every partition -> full range.
+    #   * sharded: round-robin slice (overwritten inside the branch).
+    # Modes without a defined expectation (natural, none) leave the
+    # default empty slices and the probe is gated off below.
+    partitions_for_actor: List[List[int]] = [[] for _ in range(args.num_actors)]
+
     if args.prewarm == "forced":
+        partitions_for_actor = [
+            list(range(args.num_partitions)) for _ in range(args.num_actors)
+        ]
         print(
             f"[driver] forced prewarm — {args.num_actors} actors "
             f"call dataset.prewarm_index({args.index_name!r}) in parallel"
@@ -786,7 +806,7 @@ def main() -> int:
     # L2 dir lives on the actor node and is unreachable from the driver.
     post_prewarm_l2_snaps: List[Dict[str, Any]] = []
     actor_l2_dirs: List[str] = []
-    if args.prewarm == "sharded" and args.scenario == "distributed":
+    if args.prewarm in ("sharded", "forced") and args.scenario == "distributed":
         actor_l2_dirs = [
             os.path.join(args.nvme_dir, f"actor-{i}")
             for i in range(args.num_actors)
@@ -837,15 +857,21 @@ def main() -> int:
     # state. The hit/miss counter subtraction below cancels the count
     # bump but not the replacement-policy bump, so by default we leave
     # the cache untouched between prewarm and measure.
-    # v6 port: the per-partition residency probe uses
-    # `prewarm_vector_cache(..., policy='moka_ram_cap', ram_bytes=0)` as
-    # a no-load equivalent for `partition_is_cached`. That v4 API is
-    # gone in Lance 6.0 (the strict `prewarm_index` path does not have a
-    # no-load shortcut). Disable the probe for the v6 `distributed`
-    # scenario; the v6 plan tracks the aggregate-only replacement.
-    eligible_for_residency_probe = (
-        args.prewarm == "sharded"
-        and args.scenario not in ("no-cache", "distributed")
+    # v6 aggregate-only probe: a filesystem walk under
+    # ``{l2_dir}/v1/{sanitize(prefix)}/`` plus ``Session.size_bytes()``,
+    # run on the actor via RPC. The probe is meaningful whenever the
+    # driver has a defined "expected" per-actor partition set:
+    #   * forced: every actor caches every partition.
+    #   * sharded: per-actor round-robin slice.
+    # ``no-cache`` is excluded because there is no cache to probe;
+    # ``natural`` / ``none`` are excluded because the expected set is
+    # undefined. ``distributed`` IS eligible -- this is the scenario
+    # the v6 probe was designed for. The probe is side-effect-free
+    # (filesystem walk only), so it can fire pre-measure without
+    # perturbing the cache; ``--pre-measure-residency-probe`` keeps the
+    # same flag name for back-compat.
+    eligible_for_residency_probe = is_eligible_for_residency_probe(
+        args.scenario, args.prewarm
     )
     do_pre_residency_probe = (
         eligible_for_residency_probe and args.pre_measure_residency_probe
@@ -866,10 +892,9 @@ def main() -> int:
     )
     pre_measure_residency: List[Dict[str, Any]] = []
     if do_pre_residency_probe:
-        pre_measure_residency = run_residency_check(
+        pre_measure_residency = run_l2_residency_check(
             actors=actors,
             partitions_for_actor=partitions_for_actor,
-            index_name=args.index_name,
             nvme_dir=residency_nvme_dir,
             label="post-prewarm",
         )
@@ -882,25 +907,21 @@ def main() -> int:
     elif eligible_for_residency_probe:
         print(
             "[driver] pre-measure residency probe skipped — pass "
-            "--pre-measure-residency-probe to opt in. The probe walks "
-            "the cache once per owned partition and can shift "
-            "replacement-policy state before the measured workload, "
-            "so it is off by default. The post-measure probe still runs; "
-            "hybrid_tiered shift reporting will use its validated cold-L1 "
-            "post-prewarm baseline."
+            "--pre-measure-residency-probe to opt in. The v6 aggregate-"
+            "only probe is side-effect-free (filesystem walk + "
+            "Session.size_bytes()), but is gated symmetrically with the "
+            "post-measure probe so a single flag controls both."
         )
-    elif args.prewarm == "sharded" and args.scenario == "no-cache":
+    elif args.scenario == "no-cache":
         print(
             "[driver] residency check skipped — --scenario=no-cache "
-            "populates no cache; probing would invoke prewarm_vector_cache "
-            "the no-cache path does not otherwise exercise and could "
-            "perturb the measurement"
+            "populates no cache, so there is nothing to probe."
         )
     else:
         print(
             f"[driver] residency check skipped — prewarm={args.prewarm!r} "
-            "does not set per-actor partition ownership "
-            "(check requires --prewarm sharded)"
+            "has no defined per-actor expected partition set "
+            "(probe requires --prewarm forced or sharded)"
         )
 
     # ── Phase 2: measure ──
@@ -1008,27 +1029,23 @@ def main() -> int:
 
     # ── Phase 2.5: post-measure residency check ──
     # Same probe shape as the (optional) post-prewarm one, so when both
-    # snapshots exist the comparison below shows query-driven L1 churn:
-    # any partition that moved out of L1 during measure appears in this
-    # snapshot's ``not_in_l1`` but the previous one's ``in_l1``. Under
-    # the no-vector-L1-writeback policy the displaced entry is dropped
+    # snapshots exist the comparison below shows query-driven L1 churn
+    # via the ``l1_size_bytes_at_probe`` delta. Under the
+    # no-vector-L1-writeback policy a displaced L1 entry is dropped
     # from RAM only — vector partition L2 entries already exist from
     # deterministic prewarm, so an eviction does not change L2 state.
-    # Per-partition L2 residency is not yet exposed through pylance, so
-    # ``still_in_l2`` and ``missing_from_l2`` carry the actor's
-    # ``l2_residency_source``: hybrid actors use the wait_for_disk
-    # prewarm-validated owned set, cross-checked against the
-    # post-measure L2 directory snapshot below. Runs
-    # unconditionally for sharded non-no-cache scenarios because it runs
-    # *after* measure and so cannot pollute the measured workload —
-    # unlike the pre-measure probe which is opt-in. Done before actor
-    # close so the cache is still in its post-measure state.
+    # The L2 half of the check is exact under v6: file presence
+    # one-to-one maps to L2 residency (see ``check_l2_residency.py``).
+    # Runs unconditionally for sharded non-no-cache scenarios because
+    # it runs *after* measure and so cannot pollute the measured
+    # workload — unlike the pre-measure probe which is opt-in. Done
+    # before actor close so the session is still alive to report
+    # ``Session.size_bytes()``.
     post_measure_residency: List[Dict[str, Any]] = []
     if do_post_residency_probe:
-        post_measure_residency = run_residency_check(
+        post_measure_residency = run_l2_residency_check(
             actors=actors,
             partitions_for_actor=partitions_for_actor,
-            index_name=args.index_name,
             nvme_dir=residency_nvme_dir,
             label="post-measure",
         )
@@ -1053,25 +1070,31 @@ def main() -> int:
             pre_measure_residency=pre_measure_residency,
         )
         if baseline_source is not None:
+            # v6 aggregate-only shift report: per-partition stayed /
+            # evicted / promoted counts are gone (no no-load L1 probe).
+            # Report L1 byte delta + L2 file/byte totals instead. A
+            # non-zero L1 delta with stable L2 totals is the expected
+            # signature of query-driven L1 churn under the
+            # no-vector-L1-writeback policy.
             print("\n=== Residency shift (post-prewarm → post-measure) ===")
             print(f"  baseline: post-prewarm L1 {baseline_source}")
             for r in post_measure_residency:
                 aid = r["actor_id"]
-                pre_set = pre_by_id.get(aid, set())
-                post_set = set(r["in_l1"])
-                stayed = len(pre_set & post_set)
-                evicted = len(pre_set - post_set)
-                promoted = len(post_set - pre_set)
+                pre_l1 = pre_by_id.get(aid, L1_SIZE_UNKNOWN)
+                post_l1 = int(r.get("l1_size_bytes_at_probe", L1_SIZE_UNKNOWN))
+                if pre_l1 == L1_SIZE_UNKNOWN or post_l1 == L1_SIZE_UNKNOWN:
+                    delta_str = "?"
+                else:
+                    delta_str = format_bytes(post_l1 - pre_l1)
                 still_in_l2 = len(r.get("in_l2", []))
                 missing_from_l2 = len(r.get("missing", []))
-                l2_source = r.get("l2_residency_source", "unknown")
                 print(
-                    f"  actor-{aid:<3} stayed_in_l1={stayed:<5} "
-                    f"evicted_from_l1={evicted:<5} "
-                    f"promoted_into_l1={promoted:<5} "
-                    f"still_in_l2={still_in_l2:<5} "
-                    f"missing_from_l2={missing_from_l2:<5} "
-                    f"l2_source={l2_source}"
+                    f"  actor-{aid:<3} "
+                    f"l1_pre={format_bytes(pre_l1) if pre_l1 != L1_SIZE_UNKNOWN else '?'} "
+                    f"l1_post={format_bytes(post_l1) if post_l1 != L1_SIZE_UNKNOWN else '?'} "
+                    f"Δl1={delta_str} "
+                    f"l2_files={r['l2_file_count']:<5} "
+                    f"in_l2={still_in_l2:<5} missing_from_l2={missing_from_l2:<5}"
                 )
 
     # Post-measure L2 directory snapshot — diff against the post-prewarm
@@ -1081,7 +1104,7 @@ def main() -> int:
     # so this only rules out *visible* growth and file-count churn —
     # not silent in-place overwrite — see l2_inspect.py.
     if (
-        args.prewarm == "sharded"
+        args.prewarm in ("sharded", "forced")
         and args.scenario == "distributed"
         and post_prewarm_l2_snaps
     ):
@@ -1106,11 +1129,14 @@ def main() -> int:
             delta = diff_snapshots(pre, snap) if pre else {}
             delta_str = ""
             if delta:
-                delta_str = (
-                    f"  Δ(apparent={format_bytes(delta['apparent_bytes_delta'])}, "
-                    f"disk={format_bytes(delta['disk_bytes_delta'])}, "
-                    f"files={delta['file_count_delta']:+d})"
-                )
+                pieces = [
+                    f"apparent={format_bytes(delta['apparent_bytes_delta'])}",
+                    f"disk={format_bytes(delta['disk_bytes_delta'])}",
+                    f"files={delta['file_count_delta']:+d}",
+                ]
+                if delta.get("tombstones_added"):
+                    pieces.append("tombstones_added=True")
+                delta_str = "  Δ(" + ", ".join(pieces) + ")"
             print(
                 f"  actor={aid} L2 dir={snap['path']} "
                 f"files={snap['file_count']} "
