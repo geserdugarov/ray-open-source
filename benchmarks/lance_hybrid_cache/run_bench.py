@@ -26,7 +26,7 @@ from l2_inspect import (
     format_l2_summary_line,
     snapshot_l2_dir,
 )
-from scenarios import GIB, MIB, build_scenario_specs
+from scenarios import GIB, MIB, build_scenario_specs, distributed_l2_dir_for_repeat
 
 HERE = Path(__file__).resolve().parent
 
@@ -37,11 +37,24 @@ from _hybrid_cache_helpers import (  # noqa: E402
 )
 from bench_hybrid_cache_ivf_rq import (  # noqa: E402
     ScenarioActor,
-    hybrid_l2_dir,
     maybe_drop_page_cache,
     print_summary,
     write_results,
 )
+
+
+def _nonneg_int(value: str) -> int:
+    """argparse type: reject negative values for v6 L1 sizing flags.
+
+    `--partition-l1-mb 0` disables the partition L1 tier; negative
+    values would silently disable under a `> 0` guard, hiding typos.
+    """
+    iv = int(value)
+    if iv < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 0; got {iv} (pass 0 to disable the partition L1 tier)"
+        )
+    return iv
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,27 +67,40 @@ def parse_args() -> argparse.Namespace:
         "--dram-gb",
         type=float,
         default=4.0,
-        help="L1 / moka cache size (GiB). 4 GiB << ~10 GB index forces eviction. "
-        "Applies as the total DRAM budget to BOTH moka and hybrid so the "
-        "comparison is same-DRAM (hybrid's only extra resource is L2 NVMe).",
+        help="DRAM budget for the `moka` scenario (GiB). Ignored for "
+        "`--scenarios distributed` (whose DRAM is sized by --metadata-l1-mb + "
+        "--partition-l1-mb).",
+    )
+    p.add_argument(
+        "--metadata-l1-mb",
+        type=_nonneg_int,
+        default=64,
+        help="v6 metadata-L1 budget for the distributed scenario (MiB). Holds "
+        "IvfIndexState / IndexMetadata / FragReuseIndex / ScalarIndexDetails. "
+        "Default 64.",
+    )
+    p.add_argument(
+        "--partition-l1-mb",
+        type=_nonneg_int,
+        default=1024,
+        help="v6 decoded-partition L1 budget for the distributed scenario "
+        "(MiB). Pass 0 to disable the partition-L1 tier (every decode hits "
+        "L2); negative values are rejected. Default 1024.",
     )
     p.add_argument(
         "--codecless-mb",
         type=int,
         default=None,
-        help="When set, switch the hybrid scenario to with_hybrid_cache_advanced "
-        "and reserve this many MiB of --dram-gb for the codec-less embedded "
-        "Moka. The remainder becomes the foyer DRAM tier (in front of L2). "
-        "Total hybrid DRAM stays at --dram-gb, matching moka. Use this to "
-        "override Lance's default 90/10 foyer/Moka split when the codec-less "
-        "working set (top-level index objects, scalar index pages, …) needs "
-        "more headroom than the 10%% default.",
+        help="Deprecated v4 hybrid knob. The v6 distributed cache has no "
+        "codec-less Moka tier; passing this flag prints a warning and is "
+        "otherwise ignored.",
     )
     p.add_argument(
         "--l2-gb",
         type=float,
         default=30.0,
-        help="Hybrid L2 (NVMe) capacity in GiB. Must be >= 1 GiB.",
+        help="Deprecated v4 hybrid L2-capacity knob. v6 has no L2 capacity "
+        "bookkeeping; size the actor's NVMe filesystem yourself. Ignored.",
     )
     p.add_argument(
         "--nvme-dir",
@@ -98,7 +124,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--scenarios",
         type=str,
-        default="no-cache,moka,hybrid",
+        default="no-cache,moka,distributed",
+        help="Comma-separated subset of {no-cache, moka, distributed}. "
+        "Accepts 'hybrid' as a deprecated alias for 'distributed'.",
     )
     p.add_argument("--bucket", type=str, default="lance-bench")
     p.add_argument("--endpoint-url", type=str, default="http://127.0.0.1:9000")
@@ -124,12 +152,12 @@ def parse_k_list(spec: str) -> List[int]:
 
 
 def print_l2_summary(results: List[dict]) -> None:
-    """Per-scenario L2 footprint and warmup-phase hit ratio.
+    """Per-scenario L2 footprint and session-size snapshots.
 
-    The warmup pre-stats are captured by `ScenarioActor` in
-    `stats_pre` but never printed; surfacing them lets us tell whether
-    a high `stats_post.hit_ratio` came from a warm L2 (stats_pre.hits>0
-    on entry) or from the warmup phase populating it.
+    Lance 6.0 exposes only `Session.size_bytes()`, so per-phase hit/miss
+    decomposition (the v4 "Warmup-phase counters" block) has no v6 analog.
+    The session-size delta (post - pre) is reported as the cumulative
+    growth signal; treat it as informative, not a hit-ratio replacement.
     """
     hybrid_results = [r for r in results if "l2_post_snapshot" in r]
     if hybrid_results:
@@ -145,24 +173,13 @@ def print_l2_summary(results: List[dict]) -> None:
                     f"disk={format_bytes(pre['disk_bytes'])})"
                 )
 
-    print("\n=== Warmup-phase counters (stats_pre) ===")
+    print("\n=== Session size (Lance 6.0 size_bytes) ===")
     for r in results:
-        pre = r.get("stats_pre", {})
-        post = r.get("stats_post", {})
-        pre_hits = int(pre.get("hits", 0))
-        pre_misses = int(pre.get("misses", 0))
-        pre_total = pre_hits + pre_misses
-        pre_ratio = (pre_hits / pre_total) if pre_total else 0.0
-        # Measure-phase deltas: subtracting pre from post isolates what
-        # happened during the timed run vs. what the warmup paid for.
-        delta_hits = int(post.get("hits", 0)) - pre_hits
-        delta_misses = int(post.get("misses", 0)) - pre_misses
-        delta_total = delta_hits + delta_misses
-        delta_ratio = (delta_hits / delta_total) if delta_total else 0.0
+        pre = int(r.get("stats_pre", {}).get("size_bytes", 0))
+        post = int(r.get("stats_post", {}).get("size_bytes", 0))
         print(
             f"  [{r['name']} r{r['repeat']}] "
-            f"warmup hits={pre_hits} misses={pre_misses} ratio={pre_ratio:.2%}  "
-            f"measure hits={delta_hits} misses={delta_misses} ratio={delta_ratio:.2%}"
+            f"session_size: pre={pre:,} -> post={post:,}  delta={post - pre:+,}"
         )
 
 
@@ -208,28 +225,32 @@ def main() -> int:
     scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
 
     dram_bytes = int(args.dram_gb * GIB)
-    l2_bytes = int(args.l2_gb * GIB)
     metadata_bytes = (
         int(args.metadata_mb * MIB) if args.metadata_mb is not None else None
     )
-    codecless_bytes = (
-        int(args.codecless_mb * MIB) if args.codecless_mb is not None else None
-    )
+    partition_l1_mb = int(args.partition_l1_mb)
+    metadata_l1_bytes = int(args.metadata_l1_mb) * MIB
+    partition_l1_bytes = (partition_l1_mb * MIB) if partition_l1_mb > 0 else None
+    if args.codecless_mb is not None:
+        print(
+            "[driver] --codecless-mb is a v4 hybrid knob with no v6 analog; ignored.",
+            file=sys.stderr,
+        )
     scenario_specs = build_scenario_specs(
         scenarios,
         dram_bytes=dram_bytes,
-        l2_bytes=l2_bytes,
+        l2_bytes=int(args.l2_gb * GIB),
         nvme_dir=args.nvme_dir,
         metadata_bytes=metadata_bytes,
-        codecless_bytes=codecless_bytes,
+        metadata_l1_bytes=metadata_l1_bytes,
+        partition_l1_bytes=partition_l1_bytes,
     )
-    if codecless_bytes is not None:
-        foyer_mib = (dram_bytes - codecless_bytes) // MIB
-        print(
-            f"[driver] hybrid advanced split: foyer L1 = {foyer_mib} MiB, "
-            f"codec-less Moka = {args.codecless_mb} MiB "
-            f"(total DRAM = {args.dram_gb} GiB, same as moka)"
-        )
+    print(
+        f"[driver] v6 distributed budgets: dram(moka)={args.dram_gb} GiB "
+        f"metadata_l1={args.metadata_l1_mb} MiB "
+        f"partition_l1={partition_l1_mb} MiB"
+        f"{' (disabled)' if partition_l1_bytes is None else ''}"
+    )
     if not scenario_specs:
         print(f"[driver] ERROR: no valid scenarios in {args.scenarios!r}", file=sys.stderr)
         return 2
@@ -286,18 +307,26 @@ def main() -> int:
             maybe_drop_page_cache(args.drop_page_cache, print)
 
             spec_for_actor = dict(scenario)
-            if scenario["kind"] == "hybrid":
-                spec_for_actor["l2_dir"] = hybrid_l2_dir(
-                    args.nvme_dir, scenario["name"], repeat, args.reuse_l2
+            # v6 distributed: with `--reuse-l2`, all repeats share the
+            # per-actor L2 dir so steady-state is observable; otherwise
+            # each repeat gets a fresh timestamped subdir so cold-start
+            # latency is measured honestly. The actor mkdirs it
+            # in-process before constructing the session.
+            if scenario["kind"] == "distributed":
+                spec_for_actor["l2_dir"] = distributed_l2_dir_for_repeat(
+                    args.nvme_dir,
+                    actor_id=0,
+                    repeat=repeat,
+                    reuse_l2=args.reuse_l2,
                 )
-                print(f"[driver] hybrid L2 dir: {spec_for_actor['l2_dir']}")
+                print(f"[driver] distributed L2 dir: {spec_for_actor['l2_dir']}")
 
             print(
                 f"\n[driver] {scenario['name']} repeat {repeat + 1}/{args.repeats}"
             )
             l2_pre = (
                 snapshot_l2_dir(spec_for_actor["l2_dir"])
-                if scenario["kind"] == "hybrid"
+                if scenario["kind"] == "distributed"
                 else None
             )
             actor = ScenarioActor.remote()
@@ -313,9 +342,9 @@ def main() -> int:
             )
             result = ray.get(future)
             result["repeat"] = repeat
-            if scenario["kind"] == "hybrid":
-                # Snapshot after the actor has called sess.close(), so foyer
-                # has flushed and released its O_DIRECT fds.
+            if scenario["kind"] == "distributed":
+                # Snapshot after the actor has called sess.close(), so the
+                # distributed cache has flushed and released its file lock.
                 l2_post = snapshot_l2_dir(spec_for_actor["l2_dir"])
                 result["l2_pre_snapshot"] = l2_pre
                 result["l2_post_snapshot"] = l2_post

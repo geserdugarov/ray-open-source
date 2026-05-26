@@ -75,11 +75,26 @@ class HybridSearchActor:
         # Python process; the driver's import of these modules does not
         # transfer. ray.init(runtime_env={"working_dir": ...}) ships this
         # benchmark directory to the worker so _hybrid_cache_helpers resolves.
+        import os as _os
+
         import lance
-        from _hybrid_cache_helpers import build_session, minio_storage_options
+        from _hybrid_cache_helpers import (
+            build_session,
+            minio_storage_options,
+            size_bytes_stats,
+        )
+
+        # Keep the helper reachable from non-__init__ methods.
+        self._size_bytes_stats = size_bytes_stats
 
         self._actor_id = actor_id
         self._nprobes = nprobes
+        # The v6 distributed-cache session takes an exclusive lock on
+        # `{l2_dir}/lance-distributed.lock` and rejects a missing dir.
+        # Create the per-actor dir in-process — driver-side mkdir would
+        # only see the head-node filesystem in a multi-node cluster.
+        if spec.get("kind") == "distributed":
+            _os.makedirs(spec["l2_dir"], exist_ok=True)
         self._sess = build_session(spec)
         self._ds = lance.dataset(
             uri,
@@ -118,7 +133,7 @@ class HybridSearchActor:
         return {
             "actor_id": self._actor_id,
             "duration_s": time.time() - t0,
-            "stats_post_prewarm": dict(self._sess.index_cache_stats()),
+            "stats_post_prewarm": self._size_bytes_stats(self._sess),
         }
 
     def prewarm_partitions(
@@ -132,96 +147,75 @@ class HybridSearchActor:
         ``measure_sharded`` can intersect routed partitions against its
         own slice without the driver re-sending them per query.
 
-        Calls ``prewarm_vector_cache`` with ``policy="normal"`` — the
-        policy-aware path the deprecated ``dataset.prewarm_partitions``
-        wrapper itself now delegates to. Going through the policy-aware
-        API directly avoids the ``DeprecationWarning`` Lance emits from
-        the wrapper.
+        Lance 6.0 port: calls ``dataset.prewarm_index(name,
+        partition_ids=...)`` — the strict v6 path that writes one
+        ``part-ivf-<id>.bin`` per partition under ``{l2_dir}/v1/...``
+        and raises ``LanceError`` on any L2 write failure / mid-prewarm
+        generation change. The v4 ``policy='normal'`` knob is gone in
+        v6; the distributed cache controls placement itself.
         """
-        if not hasattr(self._ds, "prewarm_vector_cache"):
+        if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
-                "this pylance build does not expose dataset.prewarm_vector_cache; "
-                "needs the deterministic vector cache prewarm primitives "
-                "(lance commit 14f9e2862 or later); rebuild pylance"
+                "this pylance build does not expose dataset.prewarm_index; "
+                "needs the Lance 6.0 distributed-cache prewarm primitive"
             )
         t0 = time.time()
-        # Dedupe to match the historical contract; the policy-aware path
-        # rejects duplicate partition ids.
+        # Dedupe to keep behavior stable; the v6 strict path tolerates
+        # duplicates but a unique list keeps the L2 file-count check
+        # cleaner downstream.
         unique_ids = list(dict.fromkeys(int(p) for p in partition_ids))
-        self._ds.prewarm_vector_cache(
-            index_name,
-            unique_ids,
-            policy="normal",
-        )
+        self._ds.prewarm_index(index_name, partition_ids=unique_ids)
         self._owned_partitions = set(unique_ids)
         self._sharded_index_name = index_name
         return {
             "actor_id": self._actor_id,
             "n_partitions": len(self._owned_partitions),
             "duration_s": time.time() - t0,
-            "stats_post_prewarm": dict(self._sess.index_cache_stats()),
+            "stats_post_prewarm": self._size_bytes_stats(self._sess),
         }
 
     def prewarm_partitions_deterministic(
         self,
         index_name: str,
         partition_ids: List[int],
-        policy: str,
-        ram_bytes: int,
+        policy: str = "",
+        ram_bytes: int = 0,
         wait_for_disk: bool = True,
     ) -> Dict[str, Any]:
-        """Deterministic forced prewarm of an IVF partition slice.
+        """Deterministic forced prewarm of an IVF partition slice (Lance 6.0).
 
-        Replaces random-query warmup as the main prewarm mechanism for
-        sharded runs. Wraps ``dataset.prewarm_vector_cache`` so the
-        driver can pick a placement policy per scenario:
+        Ports the v4 ``dataset.prewarm_vector_cache(name, ids, policy=...)``
+        call site to ``dataset.prewarm_index(name, partition_ids=ids)`` —
+        the v6 strict path that writes one ``part-ivf-<id>.bin`` per
+        partition under ``{l2_dir}/v1/...``, raises ``LanceError`` on
+        any L2 write failure / mid-prewarm generation change, and
+        produces no Python-visible counters.
 
-        * ``hybrid_tiered`` — place every requested partition into the
-          foyer L2 (NVMe) tier and intentionally leave L1 cold.
-          ``ram_bytes`` is accepted for source compatibility but ignored
-          (no L1 admissions happen during hybrid prewarm). Ordinary
-          query traffic later promotes decoded partitions out of L2
-          into volatile L1; vector partition L1 entries evicted by
-          subsequent queries are dropped from RAM and not written back
-          to L2 (the L2 entry from prewarm already exists). Requires a
-          hybrid Session.
-        * ``moka_ram_cap`` — load partitions in order until ``ram_bytes``
-          of decoded ``DeepSizeOf`` are resident, then stop. Avoids
-          churning Moka past its capacity.
-        * ``normal`` — existing behavior (every requested partition runs
-          through the default cache insert).
-
-        Returns the per-policy prewarm counters
-        (``loaded_to_ram`` — always 0 under ``hybrid_tiered``,
-        ``loaded_to_disk``, ``skipped_existing``,
-        ``stopped_before``, ``ram_bytes_deep_size`` — always 0 under
-        ``hybrid_tiered``, ``disk_bytes_serialized``,
-        ``disk_bytes_unknown_spills`` — always 0 under ``hybrid_tiered``)
-        so the driver can verify the cache filled in the expected
-        shape.
+        The v4 ``policy`` / ``ram_bytes`` / ``wait_for_disk`` arguments
+        are accepted for caller signature compatibility but ignored
+        under v6: the distributed cache controls placement itself, has
+        no L1 capacity-bookkeeping knob, and persists each partition
+        atomically (rename + fsync) so there is no separate
+        "wait for disk" gate. The returned ``prewarm_stats`` dict is
+        empty (no v6 counter binding); downstream code should rely on
+        the L2 directory snapshot for placement verification.
         """
-        if not hasattr(self._ds, "prewarm_vector_cache"):
+        if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
-                "this pylance build does not expose dataset.prewarm_vector_cache; "
-                "needs the deterministic vector cache prewarm primitives "
-                "(lance commit 14f9e2862 or later); rebuild pylance"
+                "this pylance build does not expose dataset.prewarm_index; "
+                "needs the Lance 6.0 distributed-cache prewarm primitive"
             )
         t0 = time.time()
-        prewarm_stats = self._ds.prewarm_vector_cache(
-            index_name,
-            partition_ids,
-            policy=policy,
-            ram_bytes=ram_bytes,
-            wait_for_disk=wait_for_disk,
-        )
-        self._owned_partitions = {int(p) for p in partition_ids}
+        unique_ids = list(dict.fromkeys(int(p) for p in partition_ids))
+        self._ds.prewarm_index(index_name, partition_ids=unique_ids)
+        self._owned_partitions = set(unique_ids)
         self._sharded_index_name = index_name
         return {
             "actor_id": self._actor_id,
             "n_partitions": len(self._owned_partitions),
             "duration_s": time.time() - t0,
-            "stats_post_prewarm": dict(self._sess.index_cache_stats()),
-            "prewarm_stats": dict(prewarm_stats),
+            "stats_post_prewarm": self._size_bytes_stats(self._sess),
+            "prewarm_stats": {},
             "policy": policy,
             "ram_bytes_budget": int(ram_bytes),
         }
@@ -244,7 +238,7 @@ class HybridSearchActor:
             "actor_id": self._actor_id,
             "n_partitions": len(self._owned_partitions),
             "duration_s": 0.0,
-            "stats_post_prewarm": dict(self._sess.index_cache_stats()),
+            "stats_post_prewarm": self._size_bytes_stats(self._sess),
         }
 
     def snapshot_l2_dir(self, l2_dir: str) -> Dict[str, Any]:
@@ -305,7 +299,7 @@ class HybridSearchActor:
         return {
             "actor_id": self._actor_id,
             "latencies_by_k": {int(k): v for k, v in results.items()},
-            "stats_post": dict(self._sess.index_cache_stats()),
+            "stats_post": self._size_bytes_stats(self._sess),
             "duration_s": time.time() - t0,
             "n_queries": len(queries),
         }
@@ -361,7 +355,7 @@ class HybridSearchActor:
         return {
             "actor_id": self._actor_id,
             "latencies_by_k": {int(k): v for k, v in results.items()},
-            "stats_post": dict(self._sess.index_cache_stats()),
+            "stats_post": self._size_bytes_stats(self._sess),
             "duration_s": time.time() - t0,
             "n_queries": len(queries),
             "owned_partitions": len(self._owned_partitions),
@@ -425,7 +419,7 @@ class HybridSearchActor:
         """
         return {
             "actor_id": self._actor_id,
-            "stats_post": dict(self._sess.index_cache_stats()),
+            "stats_post": self._size_bytes_stats(self._sess),
             "n_searches_handled": int(self._n_searches_handled),
             "owned_partitions": len(self._owned_partitions),
         }
@@ -559,7 +553,7 @@ class HybridSearchActor:
             # callers; remove once everything reads in_l1/not_in_l1.
             "in_ram": in_l1,
             "not_in_ram": not_in_l1,
-            "session_stats": dict(self._sess.index_cache_stats()),
+            "session_stats": self._size_bytes_stats(self._sess),
             "probe_duration_s": time.time() - t0,
         }
         if l2_dir is not None:

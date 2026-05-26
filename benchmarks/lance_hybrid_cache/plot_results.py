@@ -15,6 +15,8 @@ import pandas as pd
 SCENARIO_COLOR = {
     "no-cache": "#c44e52",
     "moka": "#dd8452",
+    "distributed": "#4c72b0",
+    # v4 alias retained so historical results.jsonl files still render.
     "hybrid": "#4c72b0",
 }
 
@@ -76,7 +78,14 @@ def plot_p99_bars(summary_csv: Path, out_png: Path) -> None:
     agg["err_hi_ms"] = (agg["hi"] - agg["median"]) * 1000.0
 
     k_values = sorted(df["k"].unique().tolist())
-    scenarios = [s for s in ("no-cache", "moka", "hybrid") if s in agg["scenario"].unique()]
+    # Plot whatever scenarios the CSV carries — v6 uses `distributed`
+    # (and accepts `hybrid` as a deprecated alias); older runs may carry
+    # the v4 names. Sort with a stable preferred order so plots stay
+    # visually consistent across runs.
+    preferred_order = ("no-cache", "moka", "distributed", "hybrid")
+    seen = list(agg["scenario"].unique())
+    scenarios = [s for s in preferred_order if s in seen]
+    scenarios.extend(s for s in seen if s not in scenarios)
     x = np.arange(len(k_values))
     width = 0.8 / max(1, len(scenarios))
 
@@ -104,22 +113,66 @@ def plot_p99_bars(summary_csv: Path, out_png: Path) -> None:
     plt.close(fig)
 
 
-def plot_hit_ratio(summary_csv: Path, out_png: Path) -> None:
+def plot_l1_size(summary_csv: Path, out_png: Path) -> None:
+    """Per-scenario L1 footprint chart (Lance 6.0).
+
+    Replaces the v4 `plot_hit_ratio` — Lance 6.0 removed
+    `index_cache_stats()` so the bench no longer has hit/miss counters.
+    The closest available signal is `Session.size_bytes()`, recorded as
+    `session_size_bytes_pre` (entering the measure phase) and
+    `session_size_bytes_post` (after). Both are duplicated across k
+    rows in `summary.csv`, so take the mean per scenario and render a
+    grouped bar chart.
+    """
     df = pd.read_csv(summary_csv)
-    # hit_ratio is a per-scenario session metric, duplicated across k rows; take first.
-    agg = df.groupby("scenario")["hit_ratio"].mean().reset_index()
-    fig, ax = plt.subplots(figsize=(6, 3.5))
+    cols = {"session_size_bytes_pre", "session_size_bytes_post"}
+    missing = cols - set(df.columns)
+    if missing:
+        # Older (v4) `summary.csv` files don't carry these columns;
+        # skip the chart rather than crash so a v4 results dir still
+        # produces the other plots.
+        print(
+            f"[plot] skipping l1_size.png — {summary_csv} lacks columns "
+            f"{sorted(missing)} (v4 file?)"
+        )
+        return
+    agg = (
+        df.groupby("scenario")[
+            ["session_size_bytes_pre", "session_size_bytes_post"]
+        ]
+        .mean()
+        .reset_index()
+    )
+    # MiB units keep the y-axis readable across moka (small) and
+    # distributed (large) scenarios.
+    mib = 1024 * 1024
+    agg["pre_mib"] = agg["session_size_bytes_pre"] / mib
+    agg["post_mib"] = agg["session_size_bytes_post"] / mib
+
+    x = np.arange(len(agg))
+    width = 0.4
+    fig, ax = plt.subplots(figsize=(7, 3.5))
     ax.bar(
-        agg["scenario"],
-        agg["hit_ratio"] * 100.0,
+        x - width / 2,
+        agg["pre_mib"].values,
+        width,
+        label="pre measure",
+        color=[SCENARIO_COLOR.get(s, "#888") for s in agg["scenario"]],
+        alpha=0.55,
+    )
+    ax.bar(
+        x + width / 2,
+        agg["post_mib"].values,
+        width,
+        label="post measure",
         color=[SCENARIO_COLOR.get(s, "#888") for s in agg["scenario"]],
     )
-    ax.set_ylabel("index-cache hit ratio (%)")
-    ax.set_ylim(0, 100)
-    ax.set_title("Lance index_cache_stats — hit ratio by scenario")
+    ax.set_xticks(x)
+    ax.set_xticklabels(agg["scenario"].tolist())
+    ax.set_ylabel("Session.size_bytes() (MiB)")
+    ax.set_title("Lance 6.0 session size — pre vs. post measure phase")
     ax.grid(True, axis="y", alpha=0.3)
-    for i, v in enumerate(agg["hit_ratio"] * 100.0):
-        ax.text(i, v + 1.0, f"{v:.1f}%", ha="center", fontsize=9)
+    ax.legend()
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120)
@@ -145,7 +198,7 @@ def main() -> int:
 
     plot_cdfs(pooled, k_values, plots_dir / "latency_cdf.png")
     plot_p99_bars(summary_csv, plots_dir / "p99_bars.png")
-    plot_hit_ratio(summary_csv, plots_dir / "hit_ratio.png")
+    plot_l1_size(summary_csv, plots_dir / "l1_size.png")
 
     print(f"[plot] wrote plots to {plots_dir}/")
     return 0
