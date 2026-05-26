@@ -1,9 +1,32 @@
 # Real 3-node Ray cluster with separate MinIO
 
+> **Status — Lance 6.0 distributed-cache port.** The driver's scenario /
+> session construction targets `Session.with_distributed_cache`;
+> `--scenario hybrid` is a deprecated alias for `--scenario distributed`,
+> and `--codecless-mb`, `--prewarm-ram-fraction`, and `--l2-gb` are
+> accepted but ignored. The per-partition residency probe is disabled
+> for `--scenario distributed`. **`--mode sharded` AND `--prewarm
+> sharded` are hard-failed at startup** because the sharded measure
+> path (`measure_sharded`) needs PyO3 wrappers for
+> `compute_partition_ids` / `search_partitions`, which are Rust-only at
+> the pinned v6 commit (see
+> [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
+> The example below has been switched from `--mode sharded` /
+> `--prewarm sharded` to `--mode replicated --prewarm forced` (every
+> actor calls `dataset.prewarm_index(name)` in parallel — the v6
+> strict prewarm path) so it runs end-to-end against a v6 Lance build;
+> the coordinator/full-recall topology returns once the PyO3 wrappers
+> land. The wider sharded prewarm narrative below still uses v4 hybrid
+> terminology — see
+> [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md)
+> for the full v6 migration plan.
+
 This guide runs the distributed Lance hybrid-cache benchmark on one
-coordinator/head node, two actor nodes, and a separate MinIO node. Keep
-`--mode sharded` and set `--num-actors 2`: the coordinator owns IVF routing
-and top-K merge, while the two workers own disjoint partition slices.
+coordinator/head node, two actor nodes, and a separate MinIO node. Under
+the v6 port `--mode replicated --num-actors 2` is the supported topology:
+each actor caches the full partition slice and answers queries
+independently; the coordinator-routed full-recall path (`--mode sharded`)
+is blocked until Lance exposes the routing primitives in Python.
 
 Install the same Python environment, Ray version, and Lance build on all three
 Ray nodes. The benchmark driver ships `benchmarks/lance_hybrid_cache/` through
@@ -428,49 +451,47 @@ source "$HOME/git/ray-open-source/python/venv/bin/activate"
 export RAY_ADDRESS="$COORD_IP:6379"
 export MINIO_HOST=10.42.0.20
 
-# Run 1: hybrid, full-recall sharded topology across two physical workers.
-# Each actor owns 1500 of 3000 partitions (round-robin mod 2). With
-# --dram-gb 1 --codecless-mb 64 the per-actor foyer L1 budget is
-# ~960 MiB of volatile DRAM; deterministic prewarm places every owned
-# partition (~5 GiB total per actor) into the actor-local NVMe L2 dir
-# and leaves L1 cold. The first measured query reads from L2 and
-# promotes decoded partitions into volatile L1; subsequent L1 evictions
-# drop from RAM only (no L1→L2 writeback).
-# --warmup-queries 0 because deterministic sharded prewarm now covers
-# every cache namespace the measure path touches.
-# --pre-measure-residency-probe verifies placement right after prewarm;
-# the driver also runs the post-measure probe before closing actors.
+# Run 1: distributed scenario, replicated topology across two physical
+# workers. Under v6 every actor caches the full slice and answers queries
+# independently; --mode replicated --prewarm forced has both actors call
+# `dataset.prewarm_index(name)` in parallel, which writes one
+# part-ivf-<id>.bin per partition under each actor's
+# <nvme-dir>/actor-<i>/v1/... atomically (rename + fsync; LanceError
+# on any mid-prewarm failure). Measure-phase queries hit local L2 and
+# the in-process partition-L1 tier. --warmup-queries 0 because forced
+# prewarm already covers every partition the measure path touches.
+# Full-recall sharded topology (each actor owning ~1/N partitions and a
+# coordinator merging top-K across actors) is the v4 baseline and
+# returns once the Lance PyO3 sharded-measure wrappers ship — see the
+# status banner above.
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
-    --scenario hybrid \
-    --num-actors 2 --dram-gb 1 --l2-gb 8 --codecless-mb 64 \
+    --scenario distributed \
+    --num-actors 2 --dram-gb 1 --l2-gb 8 \
     --nvme-dir /mnt/nvme/lance-l2/distributed \
-    --mode sharded \
+    --mode replicated --prewarm forced \
     --actor-resource search_actor_node \
-    --coordinator-resource coord_node \
     --k-list 1000 --nprobes 32 \
     --warmup-queries 0 --measure-queries 1000 \
-    --pre-measure-residency-probe \
     --endpoint-url "http://$MINIO_HOST:9000" \
-    --out-dir out/hybrid-real-2actors \
-    2>&1 | tee bench-distributed-hybrid-real-2actors.log
+    --out-dir out/distributed-real-2actors \
+    2>&1 | tee bench-distributed-real-2actors.log
 
 # Run 2: moka baseline against the dataset/index created by Run 1.
-# Deterministic prewarm uses policy='moka_ram_cap' with ram_bytes=1 GiB
-# per actor; load stops once the per-actor DRAM budget is full so the
-# remaining ~4 GiB of the actor's slice is not pulled from MinIO.
-# The same residency probes show which owned partitions remain in DRAM
-# before and after the measured query run.
+# v6 port: the v4 `policy='moka_ram_cap'` deterministic prewarm and
+# the per-partition residency probe are not bound in Lance 6.0
+# (`--mode sharded` / `--prewarm sharded` / `--pre-measure-residency-probe`
+# are blocked — see the status banner above). `--mode replicated
+# --prewarm natural` splits the warmup queries across actors and lets
+# each per-actor Moka cache converge under its `--dram-gb` cap.
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
     --scenario moka \
     --num-actors 2 --dram-gb 1 \
-    --mode sharded \
+    --mode replicated --prewarm natural \
     --actor-resource search_actor_node \
-    --coordinator-resource coord_node \
     --k-list 1000 --nprobes 32 \
-    --warmup-queries 0 --measure-queries 1000 \
-    --pre-measure-residency-probe \
+    --warmup-queries 256 --measure-queries 1000 \
     --endpoint-url "http://$MINIO_HOST:9000" \
     --skip-setup \
     --out-dir out/moka-real-2actors \
@@ -512,45 +533,46 @@ The expected console shape is:
   post-prewarm snapshot. Stable totals are the coarse fallback signal
   that vector-partition L1 eviction did not produce extra L2 writes.
 
-Because the commands above include `--pre-measure-residency-probe`, a
-`Residency shift (post-prewarm → post-measure)` block reporting
-`stayed_in_l1 / evicted_from_l1 / promoted_into_l1 / still_in_l2 /
-missing_from_l2` counts per actor prints after the post-measure block.
-If you omit the flag for a purer latency run, the driver still runs
-the post-measure probe and the L2 snapshot delta. Hybrid runs still print
-the residency-shift comparison using the validated cold-L1
-`hybrid_tiered` baseline; Moka skips the comparison because it has no
-pre-measure L1 snapshot.
-
 ### Partition residency verification
 
-Without `--pre-measure-residency-probe`, only the post-measure probe runs: it
-fires after the measured workload, so it cannot perturb the measurement, and it
-is the only block written to `<out-dir>/partition_residency.jsonl`. The probe
-calls Lance's `prewarm_vector_cache(name, [p], policy='moka_ram_cap',
-ram_bytes=0)` once per owned partition: pass 1 charges DRAM-resident
-partitions into `skipped_existing`, pass 2 short-circuits on
+> **v6 port — disabled for `--scenario distributed`.** The
+> per-partition residency probe calls v4
+> `prewarm_vector_cache(name, [p], policy='moka_ram_cap', ram_bytes=0)`
+> as a no-load probe; Lance 6.0 has no equivalent and the driver skips
+> the probe for the distributed scenario. The expected console blocks
+> and `<out-dir>/partition_residency.jsonl` described below apply to
+> the v4 `--scenario hybrid` path only. See
+> [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md)
+> ("Residency probe") for the aggregate-only v6 replacement.
+
+Under v4 the post-measure probe always ran for hybrid actors: it fires
+after the measured workload, so it cannot perturb the measurement, and
+it is the only block written to `<out-dir>/partition_residency.jsonl`.
+The probe called Lance's
+`prewarm_vector_cache(name, [p], policy='moka_ram_cap', ram_bytes=0)`
+once per owned partition: pass 1 charged DRAM-resident
+partitions into `skipped_existing`, pass 2 short-circuited on
 `ram_bytes_deep_size >= ram_bytes` (i.e. `0 >= 0`) before loading
 anything — no storage read either way.
 
-The commands above add `--pre-measure-residency-probe` to also probe between
-prewarm and measure. The flag is opt-in because the probe is no-*load* but not
-no-*touch*: it walks the cache access path once per owned partition
-immediately before the measured workload, which can shift
+Adding `--pre-measure-residency-probe` enabled a second probe between
+prewarm and measure. The flag was opt-in because the probe is no-*load*
+but not no-*touch*: it walks the cache access path once per owned
+partition immediately before the measured workload, which can shift
 replacement-policy state (recency / frequency / admission). The
-hit/miss counter subtraction in the measure phase cancels the count
+hit/miss counter subtraction in the measure phase canceled the count
 bump but not that policy bump, so by default the cache between prewarm
-and measure is left untouched. Enable the flag only when you are
-investigating prewarm placement and accept that the measure phase
-observes a post-residency-scan cache rather than the raw post-prewarm
-cache. With the flag set, both probes are written to
-`<out-dir>/partition_residency.jsonl`, one JSON line per actor per
-probe, with a `"label"` field of `"post-prewarm"` or `"post-measure"`
+and measure was left untouched. With the flag set, both probes were
+written to `<out-dir>/partition_residency.jsonl`, one JSON line per
+actor per probe, with a `"label"` field of `"post-prewarm"` or `"post-measure"`
 so downstream tooling can demux.
 
 Each line carries the full sorted lists of in-RAM and not-in-RAM
-partition ids, the session-level `index_cache_stats`, and (for hybrid)
-the per-actor L2 directory footprint.
+partition ids, the session-level cache footprint (under v6 the
+`session_stats` field is `{"size_bytes": int}` from `Session.size_bytes()`;
+under the v4 hybrid path it was the dict returned by the now-removed
+`index_cache_stats()`), and (for the v4 hybrid path) the per-actor L2
+directory footprint.
 
 Per-partition L2 residency is not yet surfaced by pylance (the underlying
 Rust helpers `partition_is_cached` / `partition_is_in_l2` exist but are

@@ -226,6 +226,8 @@ class ScenarioResult:
 
     def summary_rows(self) -> List[Dict[str, Any]]:
         rows = []
+        pre = int(self.stats_pre.get("size_bytes", 0))
+        post = int(self.stats_post.get("size_bytes", 0))
         for k, lats in self.latencies_by_k.items():
             pct = percentiles(lats)
             rows.append(
@@ -233,52 +235,63 @@ class ScenarioResult:
                     "scenario": self.name,
                     "k": k,
                     **pct,
-                    "hits": self.stats_post["hits"],
-                    "misses": self.stats_post["misses"],
-                    "hit_ratio": (
-                        self.stats_post["hits"]
-                        / max(1, self.stats_post["hits"] + self.stats_post["misses"])
-                    ),
-                    "num_entries": self.stats_post["num_entries"],
-                    "cache_size_bytes": self.stats_post["size_bytes"],
+                    "session_size_bytes_pre": pre,
+                    "session_size_bytes_post": post,
+                    "session_size_bytes_delta": post - pre,
                 }
             )
         return rows
 
 
-def build_session(spec: Dict[str, Any]):
-    """Construct a lance.Session based on a scenario spec dict.
+def size_bytes_stats(sess) -> Dict[str, int]:
+    """v6 stats dict for a Lance Session.
 
-    Expected spec shapes:
+    Lance 6.0 removed `Session.index_cache_stats()`; the sole surviving
+    accessor is `Session.size_bytes()`. The returned dict carries only
+    that one key — fabricating `hits`/`misses`/`num_entries` would let
+    downstream code report misleading 0% hit ratios for measurements
+    that are simply unavailable in v6. See
+    plans/benchmark/lance-distributed-cache-6.0.md ("Output schema and
+    helper changes") for the rationale.
+    """
+    return {"size_bytes": int(sess.size_bytes())}
+
+
+def build_session(spec: Dict[str, Any]):
+    """Construct a lance.Session for a Lance 6.0 scenario spec.
+
+    Expected spec shapes (see `scenarios.build_scenario_spec`):
       {"kind": "no-cache"}
       {"kind": "moka", "index_cache_size_bytes": int}
-      {"kind": "hybrid",
-       "l1_capacity_bytes": int,
+      {"kind": "distributed",
        "l2_dir": str,
-       "l2_capacity_bytes": int,
-       # Optional: when present, dispatch to with_hybrid_cache_advanced
-       # so foyer L1 / codec-less Moka are sized independently. In that
-       # case `l1_capacity_bytes` is the foyer DRAM tier specifically
-       # (not a combined budget split internally).
-       "codecless_capacity_bytes": int}
+       "metadata_l1_bytes": int,
+       "partition_l1_bytes": Optional[int]}
+
+    The v4 `hybrid` / `hybrid_advanced` factories are gone in Lance 6.0;
+    every distributed-cache run goes through
+    `Session.with_distributed_cache`. `no-cache` and `moka` still use
+    the plain `Session(...)` constructor that v6 retains.
     """
     kind = spec["kind"]
     if kind == "no-cache":
-        return lance.Session(index_cache_size_bytes=0)
+        kwargs: Dict[str, Any] = {"index_cache_size_bytes": 0}
+        if "metadata_cache_size_bytes" in spec:
+            kwargs["metadata_cache_size_bytes"] = int(spec["metadata_cache_size_bytes"])
+        return lance.Session(**kwargs)
     if kind == "moka":
-        return lance.Session(index_cache_size_bytes=int(spec["index_cache_size_bytes"]))
-    if kind == "hybrid":
-        if "codecless_capacity_bytes" in spec:
-            return lance.Session.with_hybrid_cache_advanced(
-                foyer_l1_capacity_bytes=int(spec["l1_capacity_bytes"]),
-                codecless_capacity_bytes=int(spec["codecless_capacity_bytes"]),
-                l2_dir=str(spec["l2_dir"]),
-                l2_capacity_bytes=int(spec["l2_capacity_bytes"]),
-            )
-        return lance.Session.with_hybrid_cache(
-            l1_capacity_bytes=int(spec["l1_capacity_bytes"]),
+        kwargs = {"index_cache_size_bytes": int(spec["index_cache_size_bytes"])}
+        if "metadata_cache_size_bytes" in spec:
+            kwargs["metadata_cache_size_bytes"] = int(spec["metadata_cache_size_bytes"])
+        return lance.Session(**kwargs)
+    if kind == "distributed":
+        partition_l1 = spec.get("partition_l1_bytes")
+        return lance.Session.with_distributed_cache(
             l2_dir=str(spec["l2_dir"]),
-            l2_capacity_bytes=int(spec["l2_capacity_bytes"]),
+            index_metadata_l1_capacity_bytes=int(spec["metadata_l1_bytes"]),
+            moka_l1_partition_bytes=(
+                int(partition_l1) if partition_l1 is not None else None
+            ),
         )
     raise ValueError(f"unknown scenario kind: {kind!r}")
 

@@ -3,18 +3,39 @@
 Measures vector-search latency for Lance's two-tier hybrid cache (foyer-backed
 L1 DRAM + L2 NVMe) against two baselines: *no cache* and *Moka DRAM-only*.
 
+> **Status — Lance 6.0 distributed-cache port.** Scenario specs and
+> `build_session` target `Session.with_distributed_cache` (the v6
+> replacement for `with_hybrid_cache` / `with_hybrid_cache_advanced`); the
+> CLIs default to `--scenario distributed` and accept `hybrid` as a
+> deprecated alias. `--codecless-mb`, `--prewarm-ram-fraction`, and
+> `--l2-gb` are accepted for back-compat but ignored under v6. Session
+> stats use `session.size_bytes()` only — `index_cache_stats()` is gone
+> in v6. **`--mode sharded` AND `--prewarm sharded` are hard-failed at
+> startup** because the sharded measure path (`measure_sharded`) needs
+> PyO3 wrappers for `compute_partition_ids` / `search_partitions`,
+> which are Rust-only at the pinned Lance 6.0 commit (see
+> [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
+> Use `--mode replicated --prewarm forced` (every actor calls
+> `dataset.prewarm_index(name)` in parallel — the v6 strict prewarm path)
+> or `--prewarm natural` / `--prewarm none`. The per-partition residency
+> probe is also disabled for `--scenario distributed` — there is no v6
+> no-load primitive yet; the L2 directory snapshot remains as the
+> placement cross-check. The narrative below still uses v4 hybrid terminology
+> (foyer L1 / L2 capacity / 90-10 split) that the v6 distributed cache
+> replaces with the per-actor metadata-L1 + partition-L1 + NVMe-L2 model;
+> the full README rewrite is tracked in
+> [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md).
+
 - **Dataset**: 10M × 1024-d f32 embeddings
 - **Index**: IVF_RQ, 3000 partitions, `num_bits=8` (~10 GB total)
-- **Scenarios**: `no-cache` | `moka` (4 GiB DRAM) | `hybrid` (4 GiB DRAM + 30 GiB NVMe L2).
-  Both `moka` and `hybrid` get the same total DRAM budget — `hybrid`'s only extra
-  resource is the NVMe L2 tier. Lance places vector partitions into L2
-  deterministically at prewarm time and never writes them back from L1 to L2;
-  ordinary query traffic decodes L2 entries and promotes them into volatile
-  foyer L1. Lance's default 90/10 foyer/Moka DRAM split governs only the
-  codec-less metadata cache (top-level vector index objects, scalar index
-  pages, legacy IVF v1 entries) — see
-  [Same-DRAM hybrid split](#same-dram-hybrid-split) for how to override
-  that split.
+- **Scenarios**: `no-cache` | `moka` (4 GiB DRAM) | `distributed` (per-actor
+  metadata L1 + partition L1 + NVMe L2; `hybrid` is a deprecated alias for
+  `distributed`). Both `moka` and `distributed` get a comparable per-actor
+  DRAM budget — the distributed scenario's extra resource is the NVMe L2
+  tier. Under Lance 6.0 the per-actor L2 subdirectory is created
+  in-process by the actor (`HybridSearchActor.__init__` and
+  `ScenarioActor.run`) just before constructing the session, so driver
+  hosts do not need write access to worker-local NVMe paths.
 - **Top-K**: 10, 100, 1000 (`nprobes=32` fixed)
 - **Storage**: MinIO on localhost, with `tc netem` adding 15 ms on MinIO's port only
   (Lance does not support HDFS; this simulates a remote object store)
@@ -39,9 +60,10 @@ pip install -e "$HOME/git/lance-open-source/python"
 # After this command:
 # - `import lance` resolves to lance-open-source/python/python/lance/ (live —
 #   edits to .py files take effect with no reinstall).
-# - The native `_lance.so` exposes `lance.Session.with_hybrid_cache(...)` and
-#   `lance.Session.close()` because the `lance` crate is built with the
-#   `hybrid-cache` Cargo feature on (declared in `python/Cargo.toml`).
+# - The native `_lance.so` exposes `lance.Session.with_distributed_cache(...)`
+#   and `lance.Session.close()` under the Lance 6.0 distributed-cache crate.
+#   (The v4 `with_hybrid_cache` / `with_hybrid_cache_advanced` factories
+#   are gone in v6; see `plans/benchmark/lance-distributed-cache-6.0.md`.)
 # - Editing Rust files under lance-open-source/python/src/ requires re-running
 #   this command (or `maturin develop`) to recompile. Python edits do not.
 #
@@ -116,61 +138,55 @@ python plot_results.py
 Results land in `out/`:
 
 - `results.jsonl` — one record per scenario × repeat with pre/post
-  `index_cache_stats`, per-k latency arrays, `duration_s`
+  `size_bytes` snapshots (the v6 stats surface — v4 hit/miss/entry
+  counters are gone), per-k latency arrays, `duration_s`
 - `summary.csv` — one row per scenario × repeat × k with p50/p95/p99/mean/n
-  and hit ratio
-- `plots/{latency_cdf,p99_bars,hit_ratio}.png`
+  and `session_size_bytes_pre` / `_post` / `_delta`
+- `plots/{latency_cdf,p99_bars,l1_size}.png` — `l1_size.png` is the v6
+  replacement for the v4 `hit_ratio.png` panel, charting per-scenario
+  `Session.size_bytes()` pre vs. post the measure phase (the v4
+  hit-ratio signal has no v6 analog).
 
-## Same-DRAM hybrid split
+## v6 DRAM split (`--metadata-l1-mb` / `--partition-l1-mb`)
 
-`moka` always gets `--dram-gb` of DRAM and nothing else. `hybrid` gets the same
-DRAM budget plus the L2 NVMe tier — `hybrid`'s win has to come from the NVMe
-headroom, not from a bigger DRAM cache.
+Under Lance 6.0 the distributed scenario's per-actor DRAM is split
+between two tiers, both sized by explicit CLI flags rather than the v4
+90/10 implicit split:
 
-Inside hybrid the DRAM budget is split between two tiers:
+- **metadata L1** (`--metadata-l1-mb`, default 64 MiB) — caches
+  `IvfIndexState`, `IndexMetadata`, `FragReuseIndex`, `ScalarIndexDetails`,
+  and the other per-query routing structures. Sizing it too small defeats
+  the per-query routing path; warn floor is 4 MiB.
+- **partition L1** (`--partition-l1-mb`, default 1024 MiB) — caches
+  decoded IVF partitions on the read path. Pass `0` to disable
+  (every partition decode then hits L2 / object storage).
 
-- **foyer L1** — volatile DRAM caching tier for decoded vector partitions.
-  Filled lazily by query traffic decoding L2 entries; vector-partition L1
-  evictions drop the entry from RAM only (no L1→L2 writeback). Deterministic
-  hybrid prewarm intentionally leaves L1 cold.
-- **codec-less embedded Moka** — separate DRAM cache for codec-less entries
-  (top-level vector index objects, scalar index pages, legacy IVF v1
-  entries — entries that don't go through the foyer encode/decode path).
+The v6 L2 tier is sized by the actor's NVMe filesystem; v6 has no L2
+capacity bookkeeping, so the v4 `--l2-gb` flag is ignored (operators
+size the partition slice against `<nvme-dir>` directly). `--codecless-mb`
+is also accepted-and-ignored — there is no codec-less Moka in v6.
 
-Two ways to size the split:
-
-| Mode | Driver flags | foyer L1 | codec-less Moka | API used |
-|---|---|---|---|---|
-| **default 90/10** | `--dram-gb 4` | ~3.6 GiB | ~410 MiB | `Session.with_hybrid_cache` |
-| **advanced** | `--dram-gb 4 --codecless-mb 64` | ~3.94 GiB | 64 MiB | `Session.with_hybrid_cache_advanced` |
-
-The default puts 90% of DRAM in foyer L1 — the volatile DRAM tier that
-query traffic populates by decoding codec-bearing IVF_RQ / IVF_PQ /
-IVF_SQ partition payloads out of L2 — and reserves 10% for the
-codec-less embedded Moka (top-level vector / scalar index objects, scalar
-index pages, legacy IVF v1 entries, and any other keys without a
-`CacheCodec`). Use `--codecless-mb` only when you need to override the
-default — e.g. push the codec-less Moka smaller (foyer-dominant workloads
-that want every byte of DRAM available for decoded vector partitions) or
-larger (workloads whose codec-less metadata working set exceeds the 10%
-reserve). Total hybrid DRAM stays at `--dram-gb` either way, so the
-moka↔hybrid comparison stays same-DRAM.
+The `moka` baseline still uses `--dram-gb` to size a single in-process
+Moka cache via `Session(index_cache_size_bytes=...)`; the v6 metadata
+budget for `moka` / `no-cache` is set via `--metadata-mb` (the legacy
+session-wide `metadata_cache_size_bytes` knob), not `--metadata-l1-mb`
+(which only affects the distributed scenario's `with_distributed_cache`
+constructor).
 
 ```bash
-# Same-DRAM, codec-path-dominant comparison: 4 GiB DRAM both sides,
-# hybrid gets +30 GiB NVMe L2 and is forced to use it (small Moka).
+# Per-actor v6 budgets: ~1 GiB partition L1 + 64 MiB metadata L1 in
+# DRAM, plus the NVMe L2 tier sized by `--nvme-dir`'s filesystem.
 python run_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
-    --dram-gb 4 --codecless-mb 64 --l2-gb 30 \
+    --dram-mb 4096 --metadata-l1-mb 64 --partition-l1-mb 1024 \
     --nvme-dir /mnt/nvme/lance-l2 \
     --k-list 10,100,1000 --nprobes 32 \
     --warmup-queries 1024 --measure-queries 5000 \
     --repeats 3 --reuse-l2
 ```
 
-Requires lance-open-source ≥ commit `8c7c4d96c` (the `with_hybrid_cache_advanced`
-classmethod). Older lance builds error on the `Session.with_hybrid_cache_advanced`
-attribute lookup; rebuild with `pip install -e $HOME/git/lance-open-source/python`.
+Requires a Lance 6.0 build that exposes `Session.with_distributed_cache`
+(see `plans/benchmark/lance-v6-api-verification.md`).
 
 ## Distributed mode (multi-actor)
 
@@ -223,50 +239,50 @@ prior `run_bench.py` already populated the bucket); Run 2 keeps
 
 ```bash
 # Per-actor budgets — total resource use is num_actors × dram-gb / l2-gb.
-# Under --mode sharded each actor caches only ~1/num_actors of the index,
-# so per-actor cache pressure is lower than --mode replicated at the same
-# budgets. Scale --dram-gb / --l2-gb down if you want each actor's slice
-# to overflow DRAM and exercise the L2 / MinIO tier.
+# Under --mode replicated every actor caches the full slice and answers
+# queries independently; the driver round-robins queries across actors.
+#
+# v6 port note: `--mode sharded` and `--prewarm sharded` are hard-failed
+# at startup (return code 2) because the sharded measure path needs
+# Lance PyO3 wrappers for `compute_partition_ids` / `search_partitions`
+# that are not yet shipped. Use `--prewarm forced` (every actor calls
+# `dataset.prewarm_index(name)` in parallel) for the v6-supported
+# replicated topology. The historical sharded narrative below ("each
+# actor caches only ~1/num_actors of the index") returns when those
+# wrappers land — see plans/benchmark/lance-distributed-cache-6.0.md.
 
-# Run 1 — hybrid sharded (creates dataset + index in MinIO if absent).
-# --mode sharded auto-forces --prewarm sharded; sharded prewarm is
-# deterministic — actor i loads its slice (round-robin mod num_actors)
-# via dataset.prewarm_vector_cache(policy='hybrid_tiered'), placing
-# every owned partition in L2 and leaving foyer L1 cold. Query traffic
-# during measurement promotes decoded partitions out of L2 into volatile
-# L1; vector-partition L1 evictions drop from RAM only (no L1→L2
-# writeback). No coord-driven random-query warmup pass is needed.
-# --codecless-mb 64 trims the codec-less Moka reserve below the default
-# 10% so essentially all of --dram-gb is available for foyer L1 to hold
-# decoded vector partitions promoted from L2; useful when the codec-less
-# working set is small. Drop --warmup-queries to 0; it is ignored under
-# --mode sharded with deterministic prewarm.
+# Run 1 — distributed replicated (creates dataset + index in MinIO if
+# absent). Forced prewarm has every actor call
+# `dataset.prewarm_index(name)` in parallel; under the v6 distributed
+# cache that writes one `part-ivf-<id>.bin` per partition under each
+# actor's `<nvme-dir>/actor-<i>/v1/...` and admits decoded partitions
+# into the in-process partition-L1 tier up to its cap. Measure-phase
+# queries hit local L2 (and partition-L1 when warm).
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
-    --scenario hybrid \
-    --num-actors 4 --dram-gb 1 --l2-gb 8 --codecless-mb 64 \
+    --scenario distributed \
+    --num-actors 4 --dram-gb 1 --l2-gb 8 \
     --nvme-dir /mnt/nvme/lance-l2/distributed \
-    --mode sharded \
+    --mode replicated --prewarm forced \
     --k-list 1000 --nprobes 32 \
     --warmup-queries 0 --measure-queries 100 \
-    --out-dir out/hybrid-sharded \
-    2>&1 | tee bench-distributed-hybrid-sharded.log
+    --out-dir out/distributed-replicated \
+    2>&1 | tee bench-distributed-replicated.log
 
-# Run 2 — moka sharded reuses the dataset+index from Run 1. --l2-gb /
-# --nvme-dir omitted because moka is pure DRAM and ignores the L2 tier.
-# Deterministic prewarm uses policy='moka_ram_cap' with ram_bytes=
-# --dram-gb per actor; load stops once the per-actor DRAM budget is
-# full so MinIO traffic isn't wasted churning the cache.
+# Run 2 — moka baseline. Reuses the dataset+index from Run 1. --l2-gb
+# and --nvme-dir omitted because moka is pure DRAM. Natural warmup
+# splits the warmup queries across actors and lets each Moka cache
+# converge under its `--dram-gb` cap (v6 has no moka_ram_cap policy).
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
     --scenario moka \
     --num-actors 4 --dram-gb 1 \
-    --mode sharded \
+    --mode replicated --prewarm natural \
     --k-list 1000 --nprobes 32 \
-    --warmup-queries 0 --measure-queries 100 \
+    --warmup-queries 256 --measure-queries 100 \
     --skip-setup \
-    --out-dir out/moka-sharded \
-    2>&1 | tee bench-distributed-moka-sharded.log
+    --out-dir out/moka-replicated \
+    2>&1 | tee bench-distributed-moka-replicated.log
 ```
 
 Key knobs unique to the distributed driver:
@@ -281,16 +297,21 @@ Key knobs unique to the distributed driver:
 | `--prewarm sharded` | Actor `i` deterministically prewarms partitions `{i, i+N, i+2N, …}` via `dataset.prewarm_vector_cache(...)`. The driver picks the placement policy from `--scenario`: `hybrid_tiered` for hybrid (place every owned vector partition into L2, leave foyer L1 cold — query traffic later promotes decoded partitions out of L2 into volatile L1, with no L1→L2 writeback path), `moka_ram_cap` for moka (load until `--dram-gb` is full, then stop), no-op for `no-cache`. Under `--mode replicated` the measure phase uses `compute_partition_ids` + `search_partitions` so each actor only searches its owned slice (per-query recall is partial — see the sharded caveat below). Under `--mode sharded` the same prewarm feeds the coordinator topology. Per-actor prewarm cost stays flat as `--num-actors` grows. Requires lance ≥ commit `14f9e2862`. |
 | `--prewarm none` | Skip prewarm; first measure query is cold. |
 | `--warmup-queries N` | Used by `--prewarm natural` (split across actors). Under `--mode sharded` it is ignored: deterministic sharded prewarm already populates every cache namespace the measure path touches. |
-| `--dram-gb` / `--l2-gb` | **Per-actor**, not aggregate. Scale down when increasing `--num-actors`. Both honoured only under `--scenario hybrid`; `moka`/`no-cache` ignore the L2 tier. |
-| `--codecless-mb N` | Per-actor codec-less Moka size; switches to `with_hybrid_cache_advanced`. Foyer L1 = `--dram-gb − --codecless-mb`. See [Same-DRAM hybrid split](#same-dram-hybrid-split). |
+| `--dram-gb` | **Per-actor** DRAM budget for the `moka` scenario. Ignored for `--scenario distributed` (whose DRAM is sized by `--metadata-l1-mb` + `--partition-l1-mb`). |
+| `--metadata-l1-mb` | **Per-actor** v6 metadata-L1 budget (MiB) for the distributed scenario. Caches `IvfIndexState`, `IndexMetadata`, etc.; default 64. See [v6 DRAM split](#v6-dram-split---metadata-l1-mb----partition-l1-mb). |
+| `--partition-l1-mb` | **Per-actor** v6 decoded-partition-L1 budget (MiB) for the distributed scenario. Pass `0` to disable; default 1024. |
+| `--l2-gb` | Deprecated v4 hybrid knob. v6 has no L2 capacity bookkeeping — size the actor's NVMe filesystem yourself. Accepted but ignored. |
+| `--codecless-mb N` | Deprecated v4 hybrid knob. The v6 distributed cache has no codec-less Moka tier; passing this flag prints a warning and is otherwise ignored. |
 | `--prewarm-ram-fraction F` | Legacy no-op. Previously scaled the hybrid foyer L1 budget used by `policy='hybrid_tiered'` when hybrid prewarm filled L1 first and the rest spilled to L2. The current `hybrid_tiered` policy places every owned partition in L2 and never admits to L1 during prewarm, so there is no L1 budget to scale; values other than `1.0` are flagged as ignored. |
 | `--pre-measure-residency-probe` | Also run the partition residency probe immediately after deterministic prewarm and before measurement. It is off by default because it walks the cache access path once per owned partition and can affect replacement policy state before the measured workload. Without it, hybrid shift reporting uses the validated cold-L1 `hybrid_tiered` baseline; moka shift reporting is skipped because there is no pre-measure L1 snapshot. |
 | `--actor-resource NAME` | Optional Ray custom resource required by each `HybridSearchActor`; use this in a real cluster to pin workers to actor nodes. Each actor reserves 1.0 of the resource. |
 | `--coordinator-resource NAME` | Optional Ray custom resource required by the `CoordinatorActor` in `--mode sharded`; use this in a real cluster to pin the coordinator to the head/coordinator node. |
 
-The summary reports both aggregate latency percentiles (across all actors)
-and per-actor rows, plus per-actor hit ratios so you can tell whether the
-fan-out is balanced. `<out-dir>/distributed_results.jsonl` has one record
+The summary reports aggregate latency percentiles (across all actors)
+and per-actor rows; per-actor cache footprint is the v6
+`Session.size_bytes()` value (the v4 hit-ratio columns are gone — Lance
+6.0 does not expose hit/miss counters). `<out-dir>/distributed_results.jsonl`
+has one record
 per actor. For sharded `moka` and `hybrid` runs, the driver also writes
 `<out-dir>/partition_residency.jsonl` after measurement; with
 `--pre-measure-residency-probe`, the same file contains both `post-prewarm`
@@ -379,9 +400,13 @@ Caveats specific to `--mode sharded`:
   `run_bench.py` single-actor path still relies on `--reuse-l2` across
   repeats because its prewarm comes from random warmup queries rather
   than deterministic L2 placement — the first repeat there reads as cold.
-- `hit_ratio`: moka ≈ 30-50% (thrashing against the 4 GiB cap), hybrid
-  approaches 100% once query traffic has promoted the working set out of
-  L2 into volatile L1.
+- `session_size_bytes`: `Session.size_bytes()` (the v6 substitute for v4
+  hit ratios) grows as partition entries land in the partition-L1 tier.
+  Distributed runs settle near `--partition-l1-mb` once the working set
+  is warm; moka cycles within `--dram-gb` as the Moka LRU thrashes
+  against the cap. Cache effectiveness is judged from measure-phase
+  latency vs. the `no-cache` baseline — Lance 6.0 does not expose
+  hit-ratio counters.
 
 ## Teardown
 
@@ -426,12 +451,14 @@ docker compose -f infra/docker-compose.yml down -v
 | Flag | Purpose |
 |---|---|
 | `--num-bits 8` | Index size is ~10 GB; `--num-bits 1` gives ~1.3 GB which fits in 4 GiB moka and makes scenarios indistinguishable. |
-| `--dram-gb 4` | Total DRAM budget; applied identically to moka and hybrid. Must be < total index size or moka doesn't thrash. |
-| `--codecless-mb 64` | Carves a fixed codec-less Moka slice off `--dram-gb` for hybrid; the rest goes to foyer L1 (in front of L2). Use to override Lance's default 90/10 foyer/Moka split — set smaller to maximise foyer L1, set larger when the codec-less metadata working set exceeds the 10% default reserve. |
-| `--l2-gb 30` | Must be ≥ 1 GiB. Size it at ≥ index size to see hybrid fully warm. |
+| `--dram-gb 4` | DRAM budget for the `moka` scenario. Ignored for `--scenarios distributed` (whose DRAM is sized by `--metadata-l1-mb` + `--partition-l1-mb`). Must be < total index size or moka doesn't thrash. |
+| `--metadata-l1-mb 64` | v6 metadata-L1 budget for the distributed scenario (MiB). Default 64; negative values rejected. |
+| `--partition-l1-mb 1024` | v6 decoded-partition-L1 budget for the distributed scenario (MiB). Pass `0` to disable; default 1024. |
+| `--codecless-mb 64` | Deprecated v4 hybrid knob. The v6 distributed cache has no codec-less Moka tier; passing this flag prints a warning and is otherwise ignored. |
+| `--l2-gb 30` | Deprecated v4 hybrid L2-capacity knob. v6 has no L2 capacity bookkeeping; size the NVMe filesystem yourself. Ignored. |
 | `--measure-queries 5000` | ≥ 1000 recommended for stable p99 at these latencies. 100 is enough to smoke-test the topology — p50/mean stay informative, but p99 collapses to a single sample. |
 | `--nprobes 32` | Keep fixed across scenarios; recall is constant, only latency varies. |
-| `--reuse-l2` | Keep L2 warm across repeats. Useful once steady-state is proven. |
+| `--reuse-l2` | Keep the per-actor L2 dir across repeats. Useful once steady-state is proven; otherwise each repeat gets a fresh timestamped subdir for honest cold-start latency. |
 
 ## Relationship to the benchmark plan
 

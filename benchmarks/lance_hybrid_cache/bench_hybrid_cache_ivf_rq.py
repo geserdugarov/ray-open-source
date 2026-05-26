@@ -44,6 +44,26 @@ from _hybrid_cache_helpers import (  # noqa: E402
     make_query_vectors,
     percentiles,
 )
+from scenarios import (  # noqa: E402
+    build_scenario_spec,
+    distributed_l2_dir_for_repeat,
+    per_actor_l2_dir,
+)
+
+
+def _nonneg_int(value: str) -> int:
+    """argparse type: reject negative values for v6 L1 sizing flags.
+
+    `--partition-l1-mb 0` disables the partition L1 tier; negative
+    values are not a valid disable spelling and would have been
+    silently mapped to None under the old `> 0` guard, hiding a typo.
+    """
+    iv = int(value)
+    if iv < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 0; got {iv} (pass 0 to disable the partition L1 tier)"
+        )
+    return iv
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,22 +80,35 @@ def parse_args() -> argparse.Namespace:
         "not all partitions fit.",
     )
     p.add_argument(
+        "--metadata-l1-mb",
+        type=_nonneg_int,
+        default=64,
+        help="v6 metadata-L1 budget for the distributed scenario (MiB). Holds "
+        "IvfIndexState, IndexMetadata, FragReuseIndex, ScalarIndexDetails, "
+        "etc.; sizing too small defeats the per-query routing path. Default 64.",
+    )
+    p.add_argument(
+        "--partition-l1-mb",
+        type=_nonneg_int,
+        default=1024,
+        help="v6 decoded-partition L1 budget for the distributed scenario (MiB). "
+        "Pass 0 to disable the partition-L1 tier (every decode hits L2); "
+        "negative values are rejected. Default 1024.",
+    )
+    p.add_argument(
         "--codecless-mb",
         type=int,
         default=None,
-        help="When set, switches the hybrid scenario to with_hybrid_cache_advanced "
-        "and reserves this many MiB of --dram-mb for the codec-less embedded "
-        "Moka. The remainder goes to the foyer DRAM tier (L1). Use to override "
-        "Lance's default 90/10 foyer/Moka split when the codec-less working set "
-        "needs a different reserve — e.g. --dram-mb 4096 --codecless-mb 64 "
-        "yields ~3.94 GiB foyer L1 and 64 MiB Moka.",
+        help="Deprecated v4 hybrid knob. The v6 distributed cache has no "
+        "codec-less Moka tier; passing this flag prints a warning and is "
+        "otherwise ignored.",
     )
     p.add_argument(
         "--l2-gb",
         type=float,
         default=4.0,
-        help="Hybrid L2 (NVMe) capacity in GiB. Must be >=1 GiB for the default "
-        "256 MiB block size.",
+        help="Deprecated v4 hybrid L2-capacity knob. v6 has no L2 capacity "
+        "bookkeeping; size the filesystem yourself. Ignored.",
     )
     p.add_argument(
         "--nvme-dir",
@@ -91,8 +124,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--scenarios",
         type=str,
-        default="no-cache,moka,hybrid",
-        help="Comma-separated subset of {no-cache, moka, hybrid}.",
+        default="no-cache,moka,distributed",
+        help="Comma-separated subset of {no-cache, moka, distributed}. "
+        "Accepts 'hybrid' as a deprecated alias for 'distributed'.",
     )
     p.add_argument("--bucket", type=str, default="lance-bench")
     p.add_argument("--endpoint-url", type=str, default="http://127.0.0.1:9000")
@@ -137,44 +171,42 @@ def maybe_drop_page_cache(enabled: bool, log) -> None:
 
 
 def build_scenario_specs(args: argparse.Namespace) -> list[dict]:
-    wanted = {s.strip() for s in args.scenarios.split(",") if s.strip()}
-    specs: list[dict] = []
-    if "no-cache" in wanted:
-        specs.append({"name": "no-cache", "kind": "no-cache"})
-    if "moka" in wanted:
-        specs.append(
-            {
-                "name": "moka",
-                "kind": "moka",
-                "index_cache_size_bytes": args.dram_mb * MIB,
-            }
+    """Build one v6 spec per scenario in --scenarios for this single-actor driver.
+
+    Aliases 'hybrid' -> 'distributed' for back-compat with v4 invocations;
+    --codecless-mb / --l2-gb are accepted for CLI compatibility but ignored
+    under the v6 distributed cache.
+    """
+    wanted = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+    if args.codecless_mb is not None:
+        print(
+            "[driver] --codecless-mb is a v4 hybrid knob with no v6 analog; ignored.",
+            file=sys.stderr,
         )
-    if "hybrid" in wanted:
-        hybrid_spec: dict = {
-            "name": "hybrid",
-            "kind": "hybrid",
-            "l2_dir": args.nvme_dir,
-            "l2_capacity_bytes": int(args.l2_gb * GIB),
-        }
-        if args.codecless_mb is None:
-            # Combined L1 budget; with_hybrid_cache splits it 90/10
-            # between foyer L1 and codec-less Moka internally (foyer
-            # gets the bulk).
-            hybrid_spec["l1_capacity_bytes"] = args.dram_mb * MIB
-        else:
-            # Independent sizing via with_hybrid_cache_advanced. --dram-mb stays
-            # the total DRAM budget across scenarios; --codecless-mb carves off
-            # a slice for the codec-less Moka, leaving the rest for foyer L1.
-            codecless = args.codecless_mb * MIB
-            total_dram = args.dram_mb * MIB
-            if codecless >= total_dram:
-                raise ValueError(
-                    f"--codecless-mb={args.codecless_mb} must be smaller than "
-                    f"--dram-mb={args.dram_mb}; nothing left for foyer L1"
+    specs: list[dict] = []
+    aliased_hybrid = False
+    for raw in wanted:
+        name = raw
+        if name == "hybrid":
+            if not aliased_hybrid:
+                print(
+                    "[driver] --scenarios: aliasing 'hybrid' -> 'distributed' "
+                    "(v6 rename).",
+                    file=sys.stderr,
                 )
-            hybrid_spec["l1_capacity_bytes"] = total_dram - codecless
-            hybrid_spec["codecless_capacity_bytes"] = codecless
-        specs.append(hybrid_spec)
+                aliased_hybrid = True
+            name = "distributed"
+        partition_l1_mb = int(getattr(args, "partition_l1_mb", 1024))
+        specs.append(
+            build_scenario_spec(
+                name,
+                actor_id=0,
+                dram_bytes=args.dram_mb * MIB,
+                nvme_dir=args.nvme_dir,
+                metadata_l1_bytes=int(args.metadata_l1_mb) * MIB,
+                partition_l1_bytes=(partition_l1_mb * MIB) if partition_l1_mb > 0 else None,
+            )
+        )
     return specs
 
 
@@ -193,6 +225,7 @@ class ScenarioActor:
         nprobes: int,
         endpoint_url: str,
     ) -> dict:
+        import os as _os
         import time as _time
 
         import lance  # noqa: F401
@@ -200,25 +233,32 @@ class ScenarioActor:
             build_session,
             measure,
             minio_storage_options,
+            size_bytes_stats,
             warmup,
         )
 
         t_start = _time.time()
+        # The v6 distributed-cache session takes an exclusive lock on
+        # `{l2_dir}/lance-distributed.lock` and rejects a missing dir.
+        # Create the per-actor dir in-process — driver-side mkdir would
+        # only see the head-node filesystem in a multi-node cluster.
+        if session_spec.get("kind") == "distributed":
+            _os.makedirs(session_spec["l2_dir"], exist_ok=True)
         sess = build_session(session_spec)
 
         storage_options = minio_storage_options(endpoint_url)
         ds = lance.dataset(uri, session=sess, storage_options=storage_options)
 
         warmup(ds, warmup_vectors, nprobes=nprobes)
-        stats_pre = sess.index_cache_stats()
+        stats_pre = size_bytes_stats(sess)
         latencies_by_k = measure(ds, measure_vectors, k_list, nprobes=nprobes)
-        stats_post = sess.index_cache_stats()
+        stats_post = size_bytes_stats(sess)
 
         sess.close()
         return {
             "name": name,
-            "stats_pre": dict(stats_pre),
-            "stats_post": dict(stats_post),
+            "stats_pre": stats_pre,
+            "stats_post": stats_post,
             "latencies_by_k": {int(k): v for k, v in latencies_by_k.items()},
             "duration_s": _time.time() - t_start,
         }
@@ -243,10 +283,11 @@ def write_results(out_dir: Path, results: list[dict]) -> None:
 
     rows: list[dict] = []
     for r in results:
+        pre = int(r.get("stats_pre", {}).get("size_bytes", 0))
+        post = int(r.get("stats_post", {}).get("size_bytes", 0))
         for k_str, lats in r["latencies_by_k"].items():
             k = int(k_str)
             pct = percentiles(lats)
-            total = r["stats_post"]["hits"] + r["stats_post"]["misses"]
             rows.append(
                 {
                     "scenario": r["name"],
@@ -257,11 +298,13 @@ def write_results(out_dir: Path, results: list[dict]) -> None:
                     "p99_s": pct["p99"],
                     "mean_s": pct["mean"],
                     "n": pct["n"],
-                    "hits": r["stats_post"]["hits"],
-                    "misses": r["stats_post"]["misses"],
-                    "hit_ratio": (r["stats_post"]["hits"] / total) if total else 0.0,
-                    "num_entries": r["stats_post"]["num_entries"],
-                    "cache_size_bytes": r["stats_post"]["size_bytes"],
+                    # v6: `Session.size_bytes()` is the only cumulative
+                    # session-size accessor; v4 hit / miss / entry counters
+                    # are gone (see plans/benchmark/lance-distributed-cache-6.0.md
+                    # "Output schema and helper changes").
+                    "session_size_bytes_pre": pre,
+                    "session_size_bytes_post": post,
+                    "session_size_bytes_delta": post - pre,
                     "duration_s": r["duration_s"],
                 }
             )
@@ -276,14 +319,15 @@ def write_results(out_dir: Path, results: list[dict]) -> None:
 def print_summary(results: list[dict]) -> None:
     print("\n=== Summary ===")
     for r in results:
-        total = r["stats_post"]["hits"] + r["stats_post"]["misses"]
-        hit_ratio = (r["stats_post"]["hits"] / total) if total else 0.0
+        pre = int(r.get("stats_pre", {}).get("size_bytes", 0))
+        post = int(r.get("stats_post", {}).get("size_bytes", 0))
+        # v6: only `Session.size_bytes()` is exposed; the v4
+        # `hit_ratio` / `cache_entries` indicators are unavailable.
         print(
             f"\n[{r['name']} r{r['repeat']}]  "
             f"duration={r['duration_s']:.1f}s  "
-            f"hit_ratio={hit_ratio:.2%}  "
-            f"cache_entries={r['stats_post']['num_entries']}  "
-            f"cache_bytes={r['stats_post']['size_bytes']:,}"
+            f"session_size: pre={pre:,} -> post={post:,}  "
+            f"delta={post - pre:+,}"
         )
         for k_str, lats in r["latencies_by_k"].items():
             pct = percentiles(lats)
@@ -345,8 +389,15 @@ def main() -> int:
         print(f"ERROR: no valid scenarios in {args.scenarios!r}", file=sys.stderr)
         return 2
 
-    if any(s["kind"] == "hybrid" for s in scenario_specs):
-        Path(args.nvme_dir).mkdir(parents=True, exist_ok=True)
+    # No driver-side mkdir under v6: the actor creates its own L2 dir
+    # in-process (see ScenarioActor.run). In a multi-node cluster the
+    # head node's filesystem is not the worker's NVMe, so mkdir-on-driver
+    # would be misleading.
+    if any(s["kind"] == "distributed" for s in scenario_specs):
+        print(
+            f"[driver] distributed L2 base: {args.nvme_dir} "
+            f"(actor process will mkdir {per_actor_l2_dir(args.nvme_dir, 0)})"
+        )
 
     all_results: list[dict] = []
     for scenario in scenario_specs:
@@ -354,11 +405,22 @@ def main() -> int:
             maybe_drop_page_cache(args.drop_page_cache, print)
 
             spec_for_actor = dict(scenario)
-            if scenario["kind"] == "hybrid":
-                spec_for_actor["l2_dir"] = hybrid_l2_dir(
-                    args.nvme_dir, scenario["name"], repeat, args.reuse_l2
+            if scenario["kind"] == "distributed":
+                # With `--reuse-l2`, share `<nvme-dir>/actor-0/` across
+                # repeats so steady-state is observable; without it, each
+                # repeat gets a fresh timestamped subdir so cold-start
+                # latency is honest. Actor mkdirs the dir in-process
+                # before constructing the session.
+                spec_for_actor["l2_dir"] = distributed_l2_dir_for_repeat(
+                    args.nvme_dir,
+                    actor_id=0,
+                    repeat=repeat,
+                    reuse_l2=args.reuse_l2,
                 )
-                print(f"[driver] hybrid L2 directory: {spec_for_actor['l2_dir']}")
+                print(
+                    f"[driver] distributed L2 dir (repeat {repeat}): "
+                    f"{spec_for_actor['l2_dir']}"
+                )
 
             print(
                 f"\n[driver] running scenario {scenario['name']} (repeat {repeat + 1}"
