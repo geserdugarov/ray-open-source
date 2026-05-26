@@ -10,17 +10,24 @@ L1 DRAM + L2 NVMe) against two baselines: *no cache* and *Moka DRAM-only*.
 > deprecated alias. `--codecless-mb`, `--prewarm-ram-fraction`, and
 > `--l2-gb` are accepted for back-compat but ignored under v6. Session
 > stats use `session.size_bytes()` only — `index_cache_stats()` is gone
-> in v6. **`--mode sharded` AND `--prewarm sharded` are hard-failed at
-> startup** because the sharded measure path (`measure_sharded`) needs
-> PyO3 wrappers for `compute_partition_ids` / `search_partitions`,
-> which are Rust-only at the pinned Lance 6.0 commit (see
-> [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
-> Use `--mode replicated --prewarm forced` (every actor calls
-> `dataset.prewarm_index(name)` in parallel — the v6 strict prewarm path)
-> or `--prewarm natural` / `--prewarm none`. The per-partition residency
-> probe is also disabled for `--scenario distributed` — there is no v6
-> no-load primitive yet; the L2 directory snapshot remains as the
-> placement cross-check. The narrative below still uses v4 hybrid terminology
+> in v6. **`--mode sharded` / `--prewarm sharded` are no longer driver-
+> blocked**; the sharded measure path depends on
+> `dataset.compute_partition_ids` and `dataset.search_partitions`, which
+> the actor (`measure_sharded`, `search_partitions`, and
+> `CoordinatorActor.__init__`) gates via `hasattr`. A pylance build that
+> ships both APIs runs end-to-end; a build that is missing either raises
+> a clear `RuntimeError` on first use rather than crashing deep in the
+> measure phase. Sharded prewarm calls the strict v6
+> `dataset.prewarm_index(name, partition_ids=...)` path and the driver
+> hard-fails before measurement if the post-prewarm L2 file walk reports
+> any missing / extra partitions for a `distributed` actor. If your
+> pylance build still lacks the wrappers (see
+> [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)),
+> use `--mode replicated --prewarm forced` (every actor calls
+> `dataset.prewarm_index(name)` in parallel — the v6 strict prewarm path),
+> `--prewarm natural`, or `--prewarm none`. The per-partition L1
+> residency probe has no v6 no-load primitive; the L2 directory snapshot
+> + `Session.size_bytes()` aggregate is the residency cross-check. The narrative below still uses v4 hybrid terminology
 > (foyer L1 / L2 capacity / 90-10 split) that the v6 distributed cache
 > replaces with the per-actor metadata-L1 + partition-L1 + NVMe-L2 model;
 > the full README rewrite is tracked in
@@ -217,9 +224,10 @@ each actor to hold the whole index or just its slice:
   override and rewrites whatever `--prewarm` you passed.
 - `--warmup-queries N` is consumed by `--prewarm natural` only. In
   `--mode sharded`, deterministic `--prewarm sharded` populates every
-  cache namespace the measurement path touches (codec-bearing IVF
-  partition entries via `prewarm_vector_cache`, plus the codec-less
-  top-level vector index objects opened on each worker). The driver
+  cache namespace the measurement path touches (IVF partition files
+  written to L2 via the v6 strict `dataset.prewarm_index(name,
+  partition_ids=...)` path, plus the top-level vector index objects
+  opened on each worker). The driver
   then runs a one-shot `compute_partition_ids` call on the coordinator
   to force-open its own top-level vector index outside the measure
   timer (the coord opens the index lazily on first centroid routing,
@@ -242,14 +250,17 @@ prior `run_bench.py` already populated the bucket); Run 2 keeps
 # Under --mode replicated every actor caches the full slice and answers
 # queries independently; the driver round-robins queries across actors.
 #
-# v6 port note: `--mode sharded` and `--prewarm sharded` are hard-failed
-# at startup (return code 2) because the sharded measure path needs
-# Lance PyO3 wrappers for `compute_partition_ids` / `search_partitions`
-# that are not yet shipped. Use `--prewarm forced` (every actor calls
-# `dataset.prewarm_index(name)` in parallel) for the v6-supported
-# replicated topology. The historical sharded narrative below ("each
-# actor caches only ~1/num_actors of the index") returns when those
-# wrappers land — see plans/benchmark/lance-distributed-cache-6.0.md.
+# v6 port note: `--mode sharded` / `--prewarm sharded` are no longer
+# driver-blocked. The actor gates `dataset.compute_partition_ids` /
+# `dataset.search_partitions` via `hasattr` and raises a clear
+# `RuntimeError` on first use if the wrappers are missing. Sharded
+# prewarm uses the v6 strict `dataset.prewarm_index(name,
+# partition_ids=...)` path; the driver post-prewarm hard-fails if the
+# per-actor L2 file walk reports missing or extra partitions. Use
+# `--mode replicated --prewarm forced` (every actor calls
+# `dataset.prewarm_index(name)` in parallel) when your pylance build
+# lacks the sharded wrappers — see
+# plans/benchmark/lance-v6-api-verification.md.
 
 # Run 1 — distributed replicated (creates dataset + index in MinIO if
 # absent). Forced prewarm has every actor call
@@ -294,7 +305,7 @@ Key knobs unique to the distributed driver:
 | `--num-actors N` | Spawn N parallel `HybridSearchActor`s. Each gets `<nvme-dir>/actor-<i>` as its L2 subdir so foyer's exclusive flock is uncontended. |
 | `--prewarm forced` | Each actor calls `dataset.prewarm_index(<index-name>)` in parallel — exercises Lance's forced-prewarm path. |
 | `--prewarm natural` | Splits `--warmup-queries` across actors (default; each cache state diverges). |
-| `--prewarm sharded` | Actor `i` deterministically prewarms partitions `{i, i+N, i+2N, …}` via `dataset.prewarm_vector_cache(...)`. The driver picks the placement policy from `--scenario`: `hybrid_tiered` for hybrid (place every owned vector partition into L2, leave foyer L1 cold — query traffic later promotes decoded partitions out of L2 into volatile L1, with no L1→L2 writeback path), `moka_ram_cap` for moka (load until `--dram-gb` is full, then stop), no-op for `no-cache`. Under `--mode replicated` the measure phase uses `compute_partition_ids` + `search_partitions` so each actor only searches its owned slice (per-query recall is partial — see the sharded caveat below). Under `--mode sharded` the same prewarm feeds the coordinator topology. Per-actor prewarm cost stays flat as `--num-actors` grows. Requires lance ≥ commit `14f9e2862`. |
+| `--prewarm sharded` | Actor `i` deterministically prewarms partitions `{i, i+N, i+2N, …}` via the v6 strict `dataset.prewarm_index(name, partition_ids=...)` path; the actor walks its L2 dir post-prewarm and reports `l2_validation` (`l2_file_count` / `missing_count` / `extra_count`) so the driver can hard-fail on placement drift. The v4 `policy` / `ram_bytes` knobs (`hybrid_tiered`, `moka_ram_cap`) are gone in v6: for `distributed` the cache controls placement itself, writing one `part-ivf-<id>.bin` per partition into L2 atomically; for `no-cache` the call is a no-op that registers ownership only. Under `--mode replicated` the measure phase uses `compute_partition_ids` + `search_partitions` so each actor only searches its owned slice (per-query recall is partial — see the sharded caveat below). Under `--mode sharded` the same prewarm feeds the coordinator topology. Per-actor prewarm cost stays flat as `--num-actors` grows. Requires a pylance build that exposes `compute_partition_ids` / `search_partitions`; the actor raises a clear `RuntimeError` on first use if either is missing (see the status banner above). |
 | `--prewarm none` | Skip prewarm; first measure query is cold. |
 | `--warmup-queries N` | Used by `--prewarm natural` (split across actors). Under `--mode sharded` it is ignored: deterministic sharded prewarm already populates every cache namespace the measure path touches. |
 | `--dram-gb` | **Per-actor** DRAM budget for the `moka` scenario. Ignored for `--scenario distributed` (whose DRAM is sized by `--metadata-l1-mb` + `--partition-l1-mb`). |
@@ -303,7 +314,7 @@ Key knobs unique to the distributed driver:
 | `--l2-gb` | Deprecated v4 hybrid knob. v6 has no L2 capacity bookkeeping — size the actor's NVMe filesystem yourself. Accepted but ignored. |
 | `--codecless-mb N` | Deprecated v4 hybrid knob. The v6 distributed cache has no codec-less Moka tier; passing this flag prints a warning and is otherwise ignored. |
 | `--prewarm-ram-fraction F` | Legacy no-op. Previously scaled the hybrid foyer L1 budget used by `policy='hybrid_tiered'` when hybrid prewarm filled L1 first and the rest spilled to L2. The current `hybrid_tiered` policy places every owned partition in L2 and never admits to L1 during prewarm, so there is no L1 budget to scale; values other than `1.0` are flagged as ignored. |
-| `--pre-measure-residency-probe` | Also run the partition residency probe immediately after deterministic prewarm and before measurement. It is off by default because it walks the cache access path once per owned partition and can affect replacement policy state before the measured workload. Without it, hybrid shift reporting uses the validated cold-L1 `hybrid_tiered` baseline; moka shift reporting is skipped because there is no pre-measure L1 snapshot. |
+| `--pre-measure-residency-probe` | Also run the v6 aggregate-only residency probe between prewarm and measure. Off by default for symmetry with the v4 narrative — the probe itself is side-effect-free under v6 (one filesystem walk under `{l2_dir}/v1/{prefix}/` plus `Session.size_bytes()` per actor, returned in a single RPC), but a single flag controls both the pre-measure and the post-measure probes so they are written symmetrically to `partition_residency.jsonl`. The v4 no-load per-partition L1 probe has no v6 equivalent — the L2 directory walk plus aggregate `Session.size_bytes()` is the replacement. The post-measure probe always runs for forced/sharded prewarm with `--scenario` other than `no-cache` because it cannot pollute the measurement. |
 | `--actor-resource NAME` | Optional Ray custom resource required by each `HybridSearchActor`; use this in a real cluster to pin workers to actor nodes. Each actor reserves 1.0 of the resource. |
 | `--coordinator-resource NAME` | Optional Ray custom resource required by the `CoordinatorActor` in `--mode sharded`; use this in a real cluster to pin the coordinator to the head/coordinator node. |
 

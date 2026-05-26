@@ -5,28 +5,35 @@
 > `--scenario hybrid` is a deprecated alias for `--scenario distributed`,
 > and `--codecless-mb`, `--prewarm-ram-fraction`, and `--l2-gb` are
 > accepted but ignored. The per-partition residency probe is disabled
-> for `--scenario distributed`. **`--mode sharded` AND `--prewarm
-> sharded` are hard-failed at startup** because the sharded measure
-> path (`measure_sharded`) needs PyO3 wrappers for
-> `compute_partition_ids` / `search_partitions`, which are Rust-only at
-> the pinned v6 commit (see
+> for `--scenario distributed`. **`--mode sharded` / `--prewarm
+> sharded` are no longer driver-blocked**; the actor
+> (`measure_sharded`, `search_partitions`, and
+> `CoordinatorActor.__init__`) gates `dataset.compute_partition_ids` /
+> `dataset.search_partitions` via `hasattr` and raises a clear
+> `RuntimeError` on first use if a pylance build is missing either
+> wrapper (see
 > [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
-> The example below has been switched from `--mode sharded` /
-> `--prewarm sharded` to `--mode replicated --prewarm forced` (every
-> actor calls `dataset.prewarm_index(name)` in parallel — the v6
-> strict prewarm path) so it runs end-to-end against a v6 Lance build;
-> the coordinator/full-recall topology returns once the PyO3 wrappers
-> land. The wider sharded prewarm narrative below still uses v4 hybrid
+> Sharded prewarm calls the v6 strict
+> `dataset.prewarm_index(name, partition_ids=...)` path; the driver
+> hard-fails before measurement if the per-actor L2 file walk reports
+> missing / extra partitions for a `distributed` actor. The example
+> below pins `--mode replicated --prewarm forced` (every actor calls
+> `dataset.prewarm_index(name)` in parallel — the v6 strict prewarm
+> path) as the safest cross-build configuration; switch to
+> `--mode sharded` once your pylance ships the sharded wrappers. The
+> wider sharded prewarm narrative below still uses v4 hybrid
 > terminology — see
 > [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md)
 > for the full v6 migration plan.
 
 This guide runs the distributed Lance hybrid-cache benchmark on one
 coordinator/head node, two actor nodes, and a separate MinIO node. Under
-the v6 port `--mode replicated --num-actors 2` is the supported topology:
-each actor caches the full partition slice and answers queries
-independently; the coordinator-routed full-recall path (`--mode sharded`)
-is blocked until Lance exposes the routing primitives in Python.
+the v6 port `--mode replicated --num-actors 2` is the topology used in
+the example: each actor caches the full partition slice and answers
+queries independently. The coordinator-routed full-recall path
+(`--mode sharded`) runs against any pylance build that ships the
+sharded wrappers; in builds that do not, the actor raises on first use
+rather than the driver pre-blocking the run.
 
 Install the same Python environment, Ray version, and Lance build on all three
 Ray nodes. The benchmark driver ships `benchmarks/lance_hybrid_cache/` through
@@ -479,11 +486,12 @@ python -u run_distributed_bench.py \
 
 # Run 2: moka baseline against the dataset/index created by Run 1.
 # v6 port: the v4 `policy='moka_ram_cap'` deterministic prewarm and
-# the per-partition residency probe are not bound in Lance 6.0
-# (`--mode sharded` / `--prewarm sharded` / `--pre-measure-residency-probe`
-# are blocked — see the status banner above). `--mode replicated
-# --prewarm natural` splits the warmup queries across actors and lets
-# each per-actor Moka cache converge under its `--dram-gb` cap.
+# the v4 per-partition L1 residency probe have no v6 no-load
+# equivalents (the L2 directory walk + `Session.size_bytes()` is the
+# v6 aggregate-only replacement; see the status banner above).
+# `--mode replicated --prewarm natural` splits the warmup queries
+# across actors and lets each per-actor Moka cache converge under its
+# `--dram-gb` cap.
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
     --scenario moka \

@@ -31,12 +31,16 @@ commit.
 
 ## Decision
 
-**This child is BLOCKED.** Both `compute_partition_ids` and
-`search_partitions` are unavailable to Python on the pinned Lance commit.
-The sharded coordinator topology in the v6 benchmark plan
-(`CoordinatorActor` -> `compute_partition_ids` for centroid routing ->
-scatter-gather of `search_partitions` to worker actors) cannot be
-implemented at the Python layer until those PyO3 wrappers ship.
+**Ray side now actor-gated.** The original verification at commit
+`9ebfe4de0` found both `compute_partition_ids` and `search_partitions`
+Rust-only. The Ray-side port (issue #7) has since landed and made the
+sharded methods (`HybridSearchActor.measure_sharded`,
+`HybridSearchActor.search_partitions`, `CoordinatorActor.__init__`)
+gate each Python API via ``hasattr``: a build that ships both runs
+end-to-end, a build that does not raises a clear `RuntimeError` on
+first use. The driver-level pre-block was lifted so the verified-API
+contract from issue #7 is honoured without preventing operators from
+running against newer pylance builds that already ship the wrappers.
 
 Per the parent issue (#3) directive recorded on this child (#4):
 
@@ -44,7 +48,9 @@ Per the parent issue (#3) directive recorded on this child (#4):
 > mark this child blocked and do not start the sharded-mode port unless
 > a human explicitly accepts a replicated-only fallback.
 
-The sharded-mode port is **not started**.
+The sharded-mode port is **started and actor-gated**; operators must
+re-run the verification (below) against their pylance build before a
+sharded run to confirm both APIs are bound.
 
 ## Unblock paths (choose one, human approval required)
 
@@ -81,4 +87,7 @@ grep -n -E 'with_distributed_cache|size_bytes|prewarm_index|compute_partition_id
 ```
 
 A non-empty result for both `compute_partition_ids` and
-`search_partitions` flips this child from blocked to ready.
+`search_partitions` confirms the actor-side `hasattr` gates will pass
+at runtime; an empty result means the sharded codepaths will raise
+`RuntimeError` on first call and the run must fall back to
+`--mode replicated --prewarm forced`.
