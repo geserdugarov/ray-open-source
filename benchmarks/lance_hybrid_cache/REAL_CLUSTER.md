@@ -1,39 +1,47 @@
 # Real 3-node Ray cluster with separate MinIO
 
-> **Status — Lance 6.0 distributed-cache port.** The driver's scenario /
-> session construction targets `Session.with_distributed_cache`;
-> `--scenario hybrid` is a deprecated alias for `--scenario distributed`,
-> and `--codecless-mb`, `--prewarm-ram-fraction`, and `--l2-gb` are
-> accepted but ignored. The per-partition residency probe is disabled
-> for `--scenario distributed`. **`--mode sharded` / `--prewarm
-> sharded` are no longer driver-blocked**; the actor
-> (`measure_sharded`, `search_partitions`, and
-> `CoordinatorActor.__init__`) gates `dataset.compute_partition_ids` /
-> `dataset.search_partitions` via `hasattr` and raises a clear
-> `RuntimeError` on first use if a pylance build is missing either
-> wrapper (see
-> [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
-> Sharded prewarm calls the v6 strict
-> `dataset.prewarm_index(name, partition_ids=...)` path; the driver
-> hard-fails before measurement if the per-actor L2 file walk reports
-> missing / extra partitions for a `distributed` actor. The example
-> below pins `--mode replicated --prewarm forced` (every actor calls
-> `dataset.prewarm_index(name)` in parallel — the v6 strict prewarm
-> path) as the safest cross-build configuration; switch to
-> `--mode sharded` once your pylance ships the sharded wrappers. The
-> wider sharded prewarm narrative below still uses v4 hybrid
-> terminology — see
-> [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md)
-> for the full v6 migration plan.
+This guide runs the Lance 6.0 distributed-cache benchmark on one
+coordinator/head node, two actor nodes, and a separate MinIO node. The
+example pins `--mode replicated --num-actors 2 --scenario distributed`
+as the cross-build-safe topology: each actor caches the full partition
+slice via the v6 best-effort `dataset.prewarm_index(name)` path (no
+`partition_ids` arg; can swallow L2 write errors / tombstoned-prefix
+skips — confirm placement via the post-prewarm L2 snapshot and
+residency probe) and answers queries independently. The coordinator-routed full-recall path
+(`--mode sharded` / `--prewarm sharded`) runs against any pylance
+build that exposes `dataset.compute_partition_ids` /
+`dataset.search_partitions`; in builds that do not, the actor
+(`HybridSearchActor.measure_sharded`,
+`HybridSearchActor.search_partitions`, `CoordinatorActor.__init__`)
+raises a clear `RuntimeError` on first use, so an end-to-end sharded
+run requires verifying that build first (see
+[`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
 
-This guide runs the distributed Lance hybrid-cache benchmark on one
-coordinator/head node, two actor nodes, and a separate MinIO node. Under
-the v6 port `--mode replicated --num-actors 2` is the topology used in
-the example: each actor caches the full partition slice and answers
-queries independently. The coordinator-routed full-recall path
-(`--mode sharded`) runs against any pylance build that ships the
-sharded wrappers; in builds that do not, the actor raises on first use
-rather than the driver pre-blocking the run.
+The wider v6 design is documented in
+[`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md);
+the v4 plan
+[`plans/benchmark/lance-hybrid-cache-ivf-rq.md`](../../plans/benchmark/lance-hybrid-cache-ivf-rq.md)
+is superseded by the v6 plan and is preserved as a historical
+reference only.
+
+## Pylance build
+
+Pin `../lance-open-source` to branch `private-cache-6.0-ver-1` at
+commit `9ebfe4de0` or newer. Build pylance from that local checkout
+rather than pulling from PyPI; the v6 distributed-cache surface
+(`Session.with_distributed_cache`, `Session.invalidate_index_cache`,
+`Session.size_bytes`, and the strict
+`dataset.prewarm_index(name, partition_ids=...)` path) is not on
+PyPI. For sharded mode you additionally need
+`dataset.compute_partition_ids` / `dataset.search_partitions`;
+without those wrappers `--mode sharded` raises on first use, but
+`--mode replicated --prewarm forced` runs unchanged.
+
+Backward-compatibility notes on the driver:
+`--scenario hybrid` is a deprecated alias for `--scenario distributed`
+and `--codecless-mb`, `--prewarm-ram-fraction`, and `--l2-gb` are
+accepted but ignored under the v6 distributed cache (which does no L2
+capacity bookkeeping and has no codec-less Moka tier).
 
 Install the same Python environment, Ray version, and Lance build on all three
 Ray nodes. The benchmark driver ships `benchmarks/lance_hybrid_cache/` through
@@ -444,9 +452,13 @@ curl -fsS -o /dev/null -w "%{http_code}\n" "http://$MINIO_HOST:9000/minio/health
 # expect: 200
 ```
 
-Each hybrid actor uses its local `<nvme-dir>/actor-<i>` L2 directory on the
-actor node where it runs. If your actor disks are mounted somewhere else,
-adjust `--nvme-dir`. The coordinator does not use the NVMe L2 path.
+Each `HybridSearchActor` uses its local `<nvme-dir>/actor-<i>` L2
+directory on the actor node where it runs; the v6
+`Session.with_distributed_cache(...)` constructor takes an exclusive
+advisory lock on `{l2_dir}/lance-distributed.lock` for the lifetime
+of the session, so the directory must be exclusive to one process.
+If your actor disks are mounted somewhere else, adjust `--nvme-dir`.
+The coordinator does not use the NVMe L2 path.
 
 ## Run the benchmark
 
@@ -461,20 +473,26 @@ export MINIO_HOST=10.42.0.20
 # Run 1: distributed scenario, replicated topology across two physical
 # workers. Under v6 every actor caches the full slice and answers queries
 # independently; --mode replicated --prewarm forced has both actors call
-# `dataset.prewarm_index(name)` in parallel, which writes one
-# part-ivf-<id>.bin per partition under each actor's
-# <nvme-dir>/actor-<i>/v1/... atomically (rename + fsync; LanceError
-# on any mid-prewarm failure). Measure-phase queries hit local L2 and
-# the in-process partition-L1 tier. --warmup-queries 0 because forced
-# prewarm already covers every partition the measure path touches.
-# Full-recall sharded topology (each actor owning ~1/N partitions and a
-# coordinator merging top-K across actors) is the v4 baseline and
-# returns once the Lance PyO3 sharded-measure wrappers ship — see the
-# status banner above.
+# `dataset.prewarm_index(name)` in parallel — the v6 best-effort
+# all-partitions form. It walks every partition and writes
+# part-ivf-<id>.bin files under each actor's
+# <nvme-dir>/actor-<i>/v1/..., but unlike the strict
+# `prewarm_index(name, partition_ids=[...])` form it can swallow L2
+# write errors and tombstoned-prefix skips rather than raising, so
+# the driver does not pre-check L2 file counts before measurement —
+# verify placement via the post-prewarm L2 snapshot and residency
+# probe. Measure-phase queries hit local L2 and the in-process
+# partition-L1 tier. --warmup-queries 0 because forced prewarm
+# already covers every partition the measure path touches. To
+# exercise the v6 freshness contract on a first run against a new
+# pylance build, switch to `--mode sharded --prewarm sharded` and
+# add `--simulate-invalidation` — see the Freshness drill section
+# below.
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
     --scenario distributed \
-    --num-actors 2 --dram-gb 1 --l2-gb 8 \
+    --num-actors 2 --dram-gb 1 \
+    --metadata-l1-mb 64 --partition-l1-mb 1024 \
     --nvme-dir /mnt/nvme/lance-l2/distributed \
     --mode replicated --prewarm forced \
     --actor-resource search_actor_node \
@@ -485,13 +503,12 @@ python -u run_distributed_bench.py \
     2>&1 | tee bench-distributed-real-2actors.log
 
 # Run 2: moka baseline against the dataset/index created by Run 1.
-# v6 port: the v4 `policy='moka_ram_cap'` deterministic prewarm and
-# the v4 per-partition L1 residency probe have no v6 no-load
-# equivalents (the L2 directory walk + `Session.size_bytes()` is the
-# v6 aggregate-only replacement; see the status banner above).
-# `--mode replicated --prewarm natural` splits the warmup queries
-# across actors and lets each per-actor Moka cache converge under its
-# `--dram-gb` cap.
+# v6 has no `policy='moka_ram_cap'` deterministic prewarm and no v4
+# per-partition L1 residency probe — the L2 directory walk plus
+# aggregate `Session.size_bytes()` is the v6 aggregate-only
+# replacement. `--mode replicated --prewarm natural` splits the
+# warmup queries across actors and lets each per-actor Moka cache
+# converge under its `--dram-gb` cap.
 python -u run_distributed_bench.py \
     --scale 10000000 --dim 1024 --num-partitions 3000 --num-bits 8 \
     --scenario moka \
@@ -506,43 +523,63 @@ python -u run_distributed_bench.py \
     2>&1 | tee bench-distributed-moka-real-2actors.log
 ```
 
-The expected console shape is:
+To run the coordinator-routed full-recall topology instead, switch to
+`--mode sharded` (the driver auto-forces `--prewarm sharded`) and add
+`--coordinator-resource coord_node`; that path requires a pylance
+build that exposes `dataset.compute_partition_ids` /
+`dataset.search_partitions`.
 
-- `Distributed summary (2 actors, mode=sharded, ...)`
-- One `[driver] sharded prewarm (deterministic, policy='hybrid_tiered') —
-  placing every owned vector partition into L2; foyer L1 remains cold`
-  block (no `ram_budget=...` field, hybrid_tiered ignores it) followed
-  by per-actor lines reporting
-  `ram=0 disk=<loaded_to_disk> skipped_l2=<n> ram_deep=0B
-  disk_serialized=<bytes>`. The driver hard-fails if `ram` is not zero or
-  if `disk_bytes_unknown_spills` is reported — those indicate a stale
-  pylance build that still admits to L1 during hybrid prewarm.
+The expected console shape for Run 1 is:
+
+- `Distributed summary (2 actors, mode=replicated, ...)` — the mode
+  field reflects `--mode`, so it reads `mode=sharded` under a sharded
+  invocation.
+- One `[driver] forced prewarm — <num_actors> actors call
+  dataset.prewarm_index(<index-name>) in parallel` block, followed by
+  per-actor lines reporting `actor=<id> prewarm=<s> bytes=<n>` from
+  `Session.size_bytes()` after the parallel `prewarm_index` call.
+  This is the v6 best-effort all-partitions form (no `partition_ids`
+  arg): it can swallow L2 write errors and tombstoned-prefix skips
+  rather than raising `LanceError`, and the driver does **not**
+  validate the per-actor L2 file count against the full owned range;
+  rely on the post-prewarm residency / L2 directory snapshot below
+  to confirm placement. (The pre-measure L2 file-count hard-fail and
+  the strict `LanceError`-on-any-failure contract only fire under
+  `--prewarm sharded`, which calls
+  `dataset.prewarm_index(name, partition_ids=[...])` — the strict v6
+  form — and where each actor's expected slice is deterministic.)
 - `[driver] L2 snapshot (post-prewarm):` followed by per-actor lines
   reporting `files=<n> apparent=<bytes> disk=<bytes>`.
-- `[driver] coord routing warmup done in <seconds>s` (one-shot
+- Under `--mode sharded` only:
+  `[driver] coord routing warmup done in <seconds>s` (one-shot
   `compute_partition_ids` call that force-opens the coordinator's
-  top-level vector index outside the measure timer).
-- `coord per-query mean: centroid=... scatter=... merge=...`
-- Two per-actor rows with balanced `owned=...` and `calls_handled=...`
-- `=== L2 residency check: post-prewarm ===` before measurement, then
+  top-level vector index outside the measure timer), then
+  `coord per-query mean: centroid=... scatter=... merge=...`.
+- Two per-actor rows. Under `--mode replicated` they include
+  per-query latency percentiles; under `--mode sharded` they report
+  `bytes=<Session.size_bytes()>  owned=<count>  calls_handled=<count>`
+  (no per-query latency on the worker side because the coordinator
+  owns the timer). The v4 `hit_ratio=...` column is gone — Lance 6.0
+  has no hit-ratio counters.
+- `=== L2 residency check: post-prewarm ===` (if
+  `--pre-measure-residency-probe` is enabled) and
   `=== L2 residency check: post-measure ===` after measurement, with
   per-actor lines reporting
   `owned=<n> in_l2=<n> missing=<n> l2_files=<n> l2_bytes=<bytes>
-  l1_bytes=<bytes> probe=<seconds>` — the verification that prewarm
-  placed the expected partitions on disk (file presence under
-  `{l2_dir}/v1/{sanitize(prefix)}/part-ivf-{id}.bin` one-to-one maps to
-  L2 residency under the v6 layout) and a coarse `Session.size_bytes()`
-  readout for the L1 tier. The v4 per-partition `in_l1` / `not_in_l1`
-  lists and `l2_source=...` inference field are gone — Lance 6.0 has
-  no no-load L1 probe, so the L1 half is byte-total only.
+  l1_bytes=<bytes> probe=<seconds>` — file presence under
+  `{l2_dir}/v1/{sanitize(prefix)}/part-ivf-{id}.bin` one-to-one maps
+  to L2 residency under the v6 layout. The L1 half is a session-wide
+  `Session.size_bytes()` readout; Lance 6.0 has no no-load L1 probe,
+  so the v4 per-partition `in_l1` / `not_in_l1` lists and the
+  `l2_source=...` inference field are gone.
 - `=== L2 directory snapshot (post-measure) ===` with per-actor lines
   reporting `files=<n> apparent=<bytes> disk=<bytes>` plus a
   `Δ(apparent=..., disk=..., files=...)` delta against the
   post-prewarm snapshot. Stable totals confirm query traffic did not
-  trigger extra L2 writes (no L1→L2 writeback for vector partitions). A
-  `tombstones_added=True` field appended to the delta is a hard error:
-  it means an invalidation rename hit the failure path and the v6
-  backend wrote a tombstone so future opens of that prefix skip it.
+  trigger extra L2 writes. A `tombstones_added=True` field appended
+  to the delta is a hard error: it means an invalidation rename hit
+  the failure path and the v6 backend wrote a tombstone so future
+  opens of that prefix skip it.
 
 ### Partition residency verification
 
@@ -643,7 +680,7 @@ python -u check_l2_residency.py \
     --num-actors 2 --num-partitions 3000 \
     --nvme-dir /mnt/nvme/lance-l2/distributed \
     --label adhoc \
-    --out out/hybrid-real-2actors/partition_residency.jsonl
+    --out out/distributed-real-2actors/partition_residency.jsonl
 ```
 
 The script resolves the bench's named actors (`hybrid-search-actor-<i>`)
@@ -652,26 +689,25 @@ via `ray.get_actor(...)` to fetch `Session.size_bytes()`; pass
 then reported as `-1`). `--help` and `--no-attach` work in environments
 without ray installed — the ray import is deferred to the attach path.
 
-### Legacy: `--prewarm-ram-fraction` and the foyer `spilled` column
+### Deprecated v4 flags
 
-Earlier hybrid prewarm filled foyer L1 first and let foyer's
-`WriteOnEviction` policy spill the remainder of each actor's slice to
-L2. Hash skew across foyer's 16-shard L1 meant a subset of L1-admitted
-partitions could end up on L2 instead of DRAM, surfaced as a
-`spilled=<count>` column on the per-actor prewarm log and rolled into
-`disk=<loaded_to_disk>`. `--prewarm-ram-fraction <f>` existed to scale
-the nominal L1 target down (~0.5 for deterministic full-L1 residency)
-in exchange for losing fill.
+`--codecless-mb`, `--prewarm-ram-fraction`, and `--l2-gb` are accepted
+by the driver for back-compat with v4 invocation scripts but ignored
+under the v6 distributed cache:
 
-The current Lance vector cache no longer writes L1 admissions back to
-L2 for IVF vector partitions. Deterministic `hybrid_tiered` prewarm
-places every owned partition straight into L2 and leaves L1 entirely
-cold, so there is no L1 admission to spill and no L1 budget for the
-fraction knob to scale. `disk_bytes_unknown_spills` is always zero —
-the driver hard-fails if it sees a non-zero value, since that indicates
-a stale pylance build that still spills. `--prewarm-ram-fraction` is
-kept as a backward-compatibility flag; values other than `1.0` print a
-warning and are otherwise ignored.
+- `--codecless-mb` carved a codec-less Moka tier out of the v4 hybrid
+  `--dram-gb` budget. v6 has no codec-less Moka tier — the
+  distributed-cache DRAM is the metadata L1 plus partition L1 tier,
+  sized by `--metadata-l1-mb` + `--partition-l1-mb`.
+- `--prewarm-ram-fraction` scaled the v4 foyer L1 prewarm target. The
+  v6 strict prewarm path places every owned partition directly in L2
+  and admits to partition L1 up to its cap from within the backend;
+  there is no operator-visible L1 budget to scale. Values other than
+  `1.0` are flagged as ignored.
+- `--l2-gb` was the v4 informational L2 capacity. v6 does no L2
+  capacity bookkeeping (`l2_writes_total` and friends are exposed only
+  on the Rust side); the operator sizes the actor's NVMe filesystem
+  against `owned_count * partition_size` directly.
 
 In sharded mode, `<out-dir>/distributed_results.jsonl` writes the coordinator
 aggregate latency row first (`actor_id="coordinator"`) and then one row per
