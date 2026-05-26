@@ -5,6 +5,16 @@
 Design only. Targets the Lance branch `private-cache-6.0-ver-1` in
 `../lance-open-source` (commits `b3d546a64..9ebfe4de0`).
 
+**Sharded-mode port BLOCKED.** Python API verification against the pinned
+commit `9ebfe4de0` confirms that `Dataset.compute_partition_ids` and
+`Dataset.search_partitions` are Rust-only and have no PyO3 wrappers.
+The other three required APIs (`Session.with_distributed_cache`,
+`Session.size_bytes`, `Dataset.prewarm_index`) are present. See
+[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) for the
+full table, unblock paths, and re-verification command. Do not start the
+`--mode sharded` rewrite until the Lance side ships the missing wrappers
+or a human explicitly accepts the replicated-only fallback.
+
 This document is the successor of
 [`lance-hybrid-cache-ivf-rq.md`](./lance-hybrid-cache-ivf-rq.md). That plan
 covers the implemented v4-era hybrid-cache benchmark (`benchmarks/lance_hybrid_cache/`,
