@@ -369,6 +369,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--simulate-invalidation",
+        action="store_true",
+        help=(
+            "After Phase 2 measure, exercise the Lance v6 freshness path: "
+            "call Session.invalidate_index_cache(uri, index_addr) on every "
+            "actor (and the coordinator under --mode sharded) with one "
+            "retry on IOError; verify the per-prefix L2 subdir is gone or "
+            "renamed to .{sanitize(prefix)}.deleting-{nonce}/ via the "
+            "L2 snapshot helper; re-run sharded prewarm (the 'cold L2 "
+            "rehydration cost'); re-run measure; write out/invalidation.json "
+            "with first/second per-k latency summaries, per-actor "
+            "invalidate times, rehydrate-prewarm time, and percentage "
+            "deltas. Requires --scenario distributed and --prewarm sharded; "
+            "moka / no-cache sessions have no v6 distributed cache to "
+            "invalidate, and only the strict sharded prewarm rehydrates "
+            "the L2 prefix deterministically."
+        ),
+    )
+    p.add_argument(
         "--pre-measure-residency-probe",
         action="store_true",
         help=(
@@ -507,6 +526,373 @@ def _format_per_actor_summary_lines(
     return lines
 
 
+def _run_measure_pass(
+    *,
+    mode: str,
+    actors: List[Any],
+    coord: Any | None,
+    measure_qs: np.ndarray,
+    k_list: List[int],
+    num_actors: int,
+    prewarm: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, float]:
+    """Run one measure pass and return (per_actor_results, coord_result, wall_s).
+
+    Extracted so the optional ``--simulate-invalidation`` drill can rerun
+    measure after the post-invalidation rehydrate without duplicating
+    the per-mode branching. In ``--mode sharded`` per-query latency is
+    owned by the coord's ``search_batch``; per-actor results are pulled
+    via ``cache_stats`` so the per-actor footprint table still
+    populates. In ``--mode replicated`` the driver splits the query
+    list round-robin and each actor times its own slice via
+    ``measure`` / ``measure_sharded``.
+    """
+    if mode == "sharded":
+        if coord is None:
+            raise ValueError("_run_measure_pass: coord must be set under --mode sharded")
+        t_measure_start = time.time()
+        coord_result = ray.get(coord.search_batch.remote(measure_qs.tolist(), k_list))
+        measure_wall_s = time.time() - t_measure_start
+        per_actor_results = ray.get([a.cache_stats.remote() for a in actors])
+        return per_actor_results, coord_result, measure_wall_s
+
+    chunks = np.array_split(measure_qs, num_actors)
+    t_measure_start = time.time()
+    if prewarm == "sharded":
+        futures = [
+            actors[i].measure_sharded.remote(chunks[i].tolist(), k_list)
+            for i in range(num_actors)
+        ]
+    else:
+        futures = [
+            actors[i].measure.remote(chunks[i].tolist(), k_list)
+            for i in range(num_actors)
+        ]
+    per_actor_results = ray.get(futures)
+    measure_wall_s = time.time() - t_measure_start
+    return per_actor_results, None, measure_wall_s
+
+
+def _aggregate_latencies_by_k(
+    per_actor_results: List[Dict[str, Any]],
+    coord_result: Dict[str, Any] | None,
+    k_list: List[int],
+) -> Dict[int, List[float]]:
+    """Flatten per-actor / coord latency lists into a single per-k list.
+
+    Mirrors the aggregate construction at the end of ``main()``. Pulled
+    out so the invalidation drill can compute summaries for the second
+    measure pass without rerunning the main aggregation block.
+    """
+    aggregated: Dict[int, List[float]] = {k: [] for k in k_list}
+    if coord_result is not None:
+        for k, lats in coord_result["latencies_by_k"].items():
+            aggregated[int(k)].extend(lats)
+    else:
+        for r in per_actor_results:
+            for k, lats in r.get("latencies_by_k", {}).items():
+                aggregated[int(k)].extend(lats)
+    return aggregated
+
+
+def _pct_delta(after: float, before: float) -> float:
+    """Return ``(after - before) / before * 100`` with a zero-baseline guard.
+
+    The invalidation drill reports the second-measure latency delta as
+    a percentage; when the first measure recorded a zero baseline (no
+    queries ran), the percentage is undefined and we return 0.0 rather
+    than dividing by zero. Negative deltas (second pass faster) are
+    preserved as-is so the operator can tell rehydrate-warm vs.
+    fully-cold apart.
+    """
+    if before == 0.0:
+        return 0.0
+    return (after - before) / before * 100.0
+
+
+def _run_invalidation_drill(
+    *,
+    args: argparse.Namespace,
+    actors: List[Any],
+    coord: Any | None,
+    measure_qs: np.ndarray,
+    k_list: List[int],
+    partitions_for_actor: List[List[int]],
+    dram_bytes: int,
+    uri: str,
+    first_pass_aggregated: Dict[int, List[float]],
+    actor_l2_dirs: List[str],
+    out_dir: Path,
+) -> Dict[str, Any]:
+    """Run the optional --simulate-invalidation drill (plan Phase 2.7).
+
+    Sequence (per ``plans/benchmark/lance-distributed-cache-6.0.md``
+    *Invalidation drill*):
+
+    1. Invalidate per actor (and coord under ``--mode sharded``) via
+       ``Session.invalidate_index_cache(uri, index_addr)`` with one
+       IOError retry. Worker actor methods resolve ``index_addr`` from
+       the index name locally so the driver does not need to know the
+       Lance-side address.
+    2. Verify each actor's L2 prefix subdir is gone or in a
+       ``.{prefix}.deleting-{nonce}/`` sentinel state via the v6
+       ``snapshot_l2_dir`` helper. Any live non-deleting prefix is a
+       freshness-contract violation and aborts the run.
+    3. Re-run sharded prewarm to time the "cold L2 rehydration cost".
+    4. Re-run the measure phase and compute per-k percentage deltas
+       against the first-pass summaries.
+
+    Writes ``out/invalidation.json`` with first/second per-k latency
+    summaries, per-actor invalidate times, rehydrate-prewarm time,
+    and percentage deltas. Returns the same payload so callers can
+    log it inline.
+    """
+    print("\n=== Phase 2.7: invalidation drill ===")
+    measure1_summary = {
+        int(k): percentiles(first_pass_aggregated[k]) for k in k_list
+    }
+
+    # Step 1: invalidate per worker; coord too in --mode sharded.
+    print(
+        f"[driver] invalidating index cache on {args.num_actors} workers"
+        f"{' + coordinator' if coord is not None else ''}"
+        f" (index={args.index_name!r})"
+    )
+    t_inv = time.time()
+    inv_results = ray.get(
+        [
+            a.invalidate_index_cache.remote(uri, args.index_name)
+            for a in actors
+        ]
+    )
+    coord_inv_result: Dict[str, Any] | None = None
+    if coord is not None:
+        coord_inv_result = ray.get(
+            coord.invalidate_index_cache.remote(uri, args.index_name)
+        )
+    invalidate_wall_s = time.time() - t_inv
+    invalidate_per_actor_s = [float(r["duration_s"]) for r in inv_results]
+
+    for r in inv_results:
+        retried_tag = "  RETRIED" if r.get("retried") else ""
+        print(
+            f"  actor={r['actor_id']} duration={r['duration_s']:.3f}s "
+            f"attempts={r['attempts']} index_addr={r['index_addr']}"
+            f"{retried_tag}"
+        )
+    if coord_inv_result is not None:
+        print(
+            f"  coordinator duration={coord_inv_result['duration_s']:.3f}s "
+            f"attempts={coord_inv_result['attempts']} "
+            f"index_addr={coord_inv_result['index_addr']}"
+            f"{'  RETRIED' if coord_inv_result.get('retried') else ''}"
+        )
+
+    # Step 2: verify L2 prefix dropped or in a .deleting-<nonce> sentinel
+    # state on every actor. The freshness contract is: post-call, either
+    # the per-prefix subdir under v1/ is gone, OR it has been atomically
+    # renamed to .{prefix}.deleting-{nonce}/ for background removal.
+    # Anything else (a live non-deleting subdir survives) means the
+    # rename failed silently and the next query may hit stale L2.
+    failed_invalidations: List[str] = []
+    invalidation_verifications: List[Dict[str, Any]] = []
+    for r in inv_results:
+        snap = r.get("l2_snapshot") or {}
+        prefix_dirs = snap.get("prefix_dirs") or []
+        live = [pd for pd in prefix_dirs if not pd.get("deleting")]
+        deleting = [pd for pd in prefix_dirs if pd.get("deleting")]
+        ok = len(live) == 0
+        invalidation_verifications.append(
+            {
+                "actor_id": r["actor_id"],
+                "ok": ok,
+                "live_prefixes": [pd.get("name") for pd in live],
+                "deleting_prefixes": [pd.get("name") for pd in deleting],
+                "tombstones_present": bool(snap.get("tombstones_present")),
+                "l2_file_count": int(snap.get("file_count", 0)),
+            }
+        )
+        if not ok:
+            failed_invalidations.append(
+                f"actor={r['actor_id']} live={[pd.get('name') for pd in live]}"
+            )
+    if failed_invalidations:
+        raise RuntimeError(
+            "Invalidation verification failed — Session.invalidate_index_cache "
+            "returned without raising but the per-prefix L2 subdir is still "
+            "live (not in a .deleting-<nonce> sentinel state) on "
+            f"{len(failed_invalidations)} actor(s); the v6 freshness contract "
+            "is violated and the next query may hit stale L2:\n  "
+            + "\n  ".join(failed_invalidations)
+        )
+    print("[driver] invalidation verified — per-actor L2 prefixes dropped / deleting")
+
+    # Step 3: re-run sharded prewarm. This is the "cold L2 rehydration"
+    # cost the drill exists to measure. We reuse the same partition slice
+    # the original prewarm used (sharded round-robin) so the rehydrated
+    # cache is byte-for-byte equivalent to the post-prewarm state of
+    # Phase 1.
+    policy, ram_bytes_budget = _deterministic_prewarm_params(
+        args.scenario, dram_bytes
+    )
+    print(
+        f"[driver] re-running sharded prewarm (policy={policy!r}) — "
+        "cold L2 rehydration"
+    )
+    t_rehyd = time.time()
+    rehyd_results = ray.get(
+        [
+            actors[i].prewarm_partitions_deterministic.remote(
+                args.index_name,
+                partitions_for_actor[i],
+                policy=policy,
+                ram_bytes=ram_bytes_budget,
+                wait_for_disk=True,
+            )
+            for i in range(args.num_actors)
+        ]
+    )
+    _assert_l2_validation_clean(rehyd_results)
+    rehydrate_prewarm_s = time.time() - t_rehyd
+    print(f"[driver] rehydrate prewarm done in {rehydrate_prewarm_s:.1f}s")
+
+    # If the coord owned an IvfIndexState in metadata L1, we just dropped
+    # it in step 1. Re-warmup the coord routing path so the first second-
+    # pass query does not pay the index-open cost.
+    if coord is not None:
+        warmup_routing_q = make_query_vectors(1, args.dim, seed=args.seed + 3)[0]
+        t_warm = time.time()
+        ray.get(coord.warmup_routing.remote(warmup_routing_q.tolist()))
+        print(
+            f"[driver] coord routing rewarmup done in {time.time() - t_warm:.1f}s"
+        )
+
+    # Step 4: re-run measure. Drives the same query plan as the first
+    # pass so percentile deltas are apples-to-apples.
+    print("[driver] re-running measure (post-invalidation)")
+    second_per_actor_results, second_coord_result, measure2_wall_s = _run_measure_pass(
+        mode=args.mode,
+        actors=actors,
+        coord=coord,
+        measure_qs=measure_qs,
+        k_list=k_list,
+        num_actors=args.num_actors,
+        prewarm=args.prewarm,
+    )
+    second_aggregated = _aggregate_latencies_by_k(
+        second_per_actor_results, second_coord_result, k_list
+    )
+    measure2_summary = {
+        int(k): percentiles(second_aggregated[k]) for k in k_list
+    }
+    print(f"[driver] measure2 wall-time: {measure2_wall_s:.1f}s")
+    for k in k_list:
+        print(format_latency_row("measure2", k, measure2_summary[k]))
+
+    # Step 5: compute deltas + write invalidation.json.
+    primary_k = int(k_list[0])
+    m1 = measure1_summary[primary_k]
+    m2 = measure2_summary[primary_k]
+    delta_p50_pct = _pct_delta(m2["p50"], m1["p50"])
+    delta_p95_pct = _pct_delta(m2["p95"], m1["p95"])
+    delta_p99_pct = _pct_delta(m2["p99"], m1["p99"])
+    delta_mean_pct = _pct_delta(m2["mean"], m1["mean"])
+
+    delta_by_k = {
+        str(k): {
+            "delta_p50_pct": _pct_delta(measure2_summary[k]["p50"], measure1_summary[k]["p50"]),
+            "delta_p95_pct": _pct_delta(measure2_summary[k]["p95"], measure1_summary[k]["p95"]),
+            "delta_p99_pct": _pct_delta(measure2_summary[k]["p99"], measure1_summary[k]["p99"]),
+            "delta_mean_pct": _pct_delta(measure2_summary[k]["mean"], measure1_summary[k]["mean"]),
+        }
+        for k in k_list
+    }
+
+    # Optional: snapshot L2 after rehydrate so the JSON carries the
+    # rehydrated footprint per actor (lets operators correlate
+    # rehydrate-cost-vs-bytes without a follow-up walk).
+    post_rehydrate_l2 = []
+    if actor_l2_dirs:
+        post_rehydrate_l2 = ray.get(
+            [
+                actors[i].snapshot_l2_dir.remote(actor_l2_dirs[i])
+                for i in range(args.num_actors)
+            ]
+        )
+
+    payload: Dict[str, Any] = {
+        "primary_k": primary_k,
+        "k_list": k_list,
+        "num_actors": args.num_actors,
+        "mode": args.mode,
+        "scenario": args.scenario,
+        "prewarm": args.prewarm,
+        # Plan-style flat fields (primary k) for the canonical schema.
+        "measure1_p50_s": float(m1["p50"]),
+        "measure1_p95_s": float(m1["p95"]),
+        "invalidate_per_actor_s": invalidate_per_actor_s,
+        "invalidate_wall_s": float(invalidate_wall_s),
+        "rehydrate_prewarm_s": float(rehydrate_prewarm_s),
+        "measure2_p50_s": float(m2["p50"]),
+        "measure2_p95_s": float(m2["p95"]),
+        "delta_p50_pct": float(delta_p50_pct),
+        "delta_p95_pct": float(delta_p95_pct),
+        "delta_p99_pct": float(delta_p99_pct),
+        "delta_mean_pct": float(delta_mean_pct),
+        # Per-k breakdown for callers that drive --k-list with multiple ks.
+        "measure1_summary_by_k": {
+            str(k): measure1_summary[k] for k in k_list
+        },
+        "measure2_summary_by_k": {
+            str(k): measure2_summary[k] for k in k_list
+        },
+        "delta_by_k": delta_by_k,
+        # Per-actor invalidation detail + L2 verification.
+        "invalidations": [
+            {
+                "actor_id": r["actor_id"],
+                "index_addr": r["index_addr"],
+                "duration_s": float(r["duration_s"]),
+                "attempts": int(r["attempts"]),
+                "retried": bool(r.get("retried", False)),
+                "retry_error": r.get("retry_error"),
+            }
+            for r in inv_results
+        ],
+        "coordinator_invalidation": (
+            {
+                "duration_s": float(coord_inv_result["duration_s"]),
+                "attempts": int(coord_inv_result["attempts"]),
+                "index_addr": coord_inv_result["index_addr"],
+                "retried": bool(coord_inv_result.get("retried", False)),
+                "retry_error": coord_inv_result.get("retry_error"),
+            }
+            if coord_inv_result is not None
+            else None
+        ),
+        "invalidation_verifications": invalidation_verifications,
+        "post_rehydrate_l2": [
+            {
+                "actor_id": snap.get("actor_id"),
+                "exists": bool(snap.get("exists")),
+                "file_count": int(snap.get("file_count", 0)),
+                "apparent_bytes": int(snap.get("apparent_bytes", 0)),
+                "disk_bytes": int(snap.get("disk_bytes", 0)),
+                "tombstones_present": bool(snap.get("tombstones_present")),
+            }
+            for snap in post_rehydrate_l2
+        ],
+    }
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "invalidation.json"
+    with out_path.open("w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    print(f"[driver] wrote {out_path}")
+
+    return payload
+
+
 def main() -> int:
     args = parse_args()
     k_list = parse_k_list(args.k_list)
@@ -537,6 +923,26 @@ def main() -> int:
             f"[driver] --mode=sharded forces --prewarm=sharded (was {args.prewarm!r})"
         )
         args.prewarm = "sharded"
+
+    # The invalidation drill only makes sense when there is a v6
+    # distributed cache to invalidate (--scenario distributed) and a
+    # deterministic per-actor partition slice to rehydrate (--prewarm
+    # sharded). Reject other combinations early so we do not waste a
+    # 10M-vector measure pass before discovering the drill cannot run.
+    if args.simulate_invalidation:
+        if args.scenario != "distributed":
+            raise SystemExit(
+                f"--simulate-invalidation requires --scenario=distributed "
+                f"(got {args.scenario!r}); moka / no-cache sessions have no "
+                "v6 distributed cache to invalidate"
+            )
+        if args.prewarm != "sharded":
+            raise SystemExit(
+                f"--simulate-invalidation requires --prewarm=sharded "
+                f"(got {args.prewarm!r}); only the strict sharded prewarm "
+                "rehydrates the L2 prefix deterministically after "
+                "invalidation"
+            )
 
     spec = DatasetSpec(
         scale=args.scale,
@@ -1011,14 +1417,6 @@ def main() -> int:
                 f"partition + index caches (was {len(warmup_qs)} warmup "
                 f"queries)"
             )
-        # v6: no hit/miss counters, so the v4 pre-measure baseline
-        # snapshot has nothing to subtract — dropped.
-        t_measure_start = time.time()
-        coord_result = ray.get(coord.search_batch.remote(measure_qs.tolist(), k_list))
-        measure_wall_s = time.time() - t_measure_start
-        # Pull per-actor cache stats post-measure — coord doesn't have
-        # them since it never touched partition data.
-        per_actor_results = ray.get([a.cache_stats.remote() for a in actors])
     else:
         chunks = np.array_split(measure_qs, args.num_actors)
         n_per_actor = [len(c) for c in chunks]
@@ -1027,28 +1425,21 @@ def main() -> int:
             f"[driver] measure ({measure_method}) — query slice sizes per actor: "
             f"{n_per_actor} (× {len(k_list)} k-values each)"
         )
-        # v6 cache stats are cumulative `size_bytes` only; there is no
-        # hit / miss counter to baseline-subtract here, so the v4
-        # pre-measure snapshot the driver used to take is dropped.
-        # Downstream callers wanting a delta should snapshot
-        # `cache_stats` themselves outside the measure window.
-        t_measure_start = time.time()
-        if args.prewarm == "sharded":
-            # measure_sharded uses each actor's owned partition slice (set by
-            # prewarm_partitions); per-query result is partial top-K within
-            # that slice, so the aggregate latency table reflects per-actor
-            # work, not full-recall query cost. See README §sharded.
-            futures = [
-                actors[i].measure_sharded.remote(chunks[i].tolist(), k_list)
-                for i in range(args.num_actors)
-            ]
-        else:
-            futures = [
-                actors[i].measure.remote(chunks[i].tolist(), k_list)
-                for i in range(args.num_actors)
-            ]
-        per_actor_results = ray.get(futures)
-        measure_wall_s = time.time() - t_measure_start
+
+    # v6 cache stats are cumulative `size_bytes` only; there is no
+    # hit / miss counter to baseline-subtract here, so the v4
+    # pre-measure snapshot the driver used to take is dropped.
+    # Downstream callers wanting a delta should snapshot
+    # `cache_stats` themselves outside the measure window.
+    per_actor_results, coord_result, measure_wall_s = _run_measure_pass(
+        mode=args.mode,
+        actors=actors,
+        coord=coord,
+        measure_qs=measure_qs,
+        k_list=k_list,
+        num_actors=args.num_actors,
+        prewarm=args.prewarm,
+    )
 
     # ── Phase 2.5: post-measure residency check ──
     # Same probe shape as the (optional) post-prewarm one, so when both
@@ -1164,6 +1555,33 @@ def main() -> int:
                 f"apparent={format_bytes(int(snap['apparent_bytes']))} "
                 f"disk={format_bytes(int(snap['disk_bytes']))}" + delta_str
             )
+
+    # ── Phase 2.7: optional invalidation drill ──
+    # Only fires under --simulate-invalidation. The drill exercises the
+    # Lance v6 freshness contract end-to-end: invalidate every actor's
+    # (and coord's) cache, verify the per-prefix L2 subdir went away or
+    # is in a .deleting-<nonce>/ sentinel state, re-prewarm to time the
+    # cold-L2 rehydration cost, then re-measure to confirm warm latency
+    # returns to first-pass numbers. The early CLI guard restricts this
+    # combination to (distributed, sharded); the drill itself assumes
+    # those preconditions hold.
+    if args.simulate_invalidation:
+        first_pass_aggregated = _aggregate_latencies_by_k(
+            per_actor_results, coord_result, k_list
+        )
+        _run_invalidation_drill(
+            args=args,
+            actors=actors,
+            coord=coord,
+            measure_qs=measure_qs,
+            k_list=k_list,
+            partitions_for_actor=partitions_for_actor,
+            dram_bytes=dram_bytes,
+            uri=uri,
+            first_pass_aggregated=first_pass_aggregated,
+            actor_l2_dirs=actor_l2_dirs,
+            out_dir=out_dir,
+        )
 
     # ── Phase 3: close + cleanup ──
     ray.get([a.close.remote() for a in actors])
