@@ -61,6 +61,25 @@ def distributed_l2_dir_for_repeat(
     return os.path.join(base_nvme_dir, suffix)
 
 
+def is_eligible_for_residency_probe(scenario: str, prewarm: str) -> bool:
+    """Whether the v6 aggregate-only residency probe should run.
+
+    The probe needs an L2 directory to walk *and* a defined per-actor
+    expected partition set:
+
+    * ``no-cache``: nothing to probe (no cache tier).
+    * ``forced`` / ``sharded`` prewarm: per-actor expected set is
+      well-defined (full range / round-robin slice respectively).
+    * ``natural`` / ``none`` prewarm: the expected set is undefined;
+      the probe has no reference to report ``missing`` against.
+
+    Notably this returns True for ``distributed`` -- the scenario the
+    v6 probe was designed for -- under either forced or sharded
+    prewarm.
+    """
+    return prewarm in ("forced", "sharded") and scenario != "no-cache"
+
+
 def per_actor_l2_dir(base_nvme_dir: str, actor_id: int) -> str:
     """Per-actor L2 subdirectory under the operator-supplied `--nvme-dir`.
 

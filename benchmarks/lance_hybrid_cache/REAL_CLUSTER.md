@@ -516,95 +516,103 @@ The expected console shape is:
   top-level vector index outside the measure timer).
 - `coord per-query mean: centroid=... scatter=... merge=...`
 - Two per-actor rows with balanced `owned=...` and `calls_handled=...`
-- `=== Partition residency check: post-prewarm ===` before measurement,
-  then `=== Partition residency check: post-measure ===` after measurement,
-  with per-actor lines reporting
-  `probed=<n> in_l1=<n> not_in_l1=<n> in_l2=<n> missing=<n>` plus a sample
-  of partition ids in each tier — the verification that prewarm placed
-  the expected partitions into L2 and that query traffic promoted some
-  partitions into L1 without losing any from L2. The `l2_source=...`
-  field at end of each line marks whether per-partition L2 residency came
-  from a bound index probe or, today, from
-  `prewarm_validated_owned_set+dir_snapshot(no_index_probe)` (the Rust
-  `partition_is_in_l2` is not yet exposed to Python).
+- `=== L2 residency check: post-prewarm ===` before measurement, then
+  `=== L2 residency check: post-measure ===` after measurement, with
+  per-actor lines reporting
+  `owned=<n> in_l2=<n> missing=<n> l2_files=<n> l2_bytes=<bytes>
+  l1_bytes=<bytes> probe=<seconds>` — the verification that prewarm
+  placed the expected partitions on disk (file presence under
+  `{l2_dir}/v1/{sanitize(prefix)}/part-ivf-{id}.bin` one-to-one maps to
+  L2 residency under the v6 layout) and a coarse `Session.size_bytes()`
+  readout for the L1 tier. The v4 per-partition `in_l1` / `not_in_l1`
+  lists and `l2_source=...` inference field are gone — Lance 6.0 has
+  no no-load L1 probe, so the L1 half is byte-total only.
 - `=== L2 directory snapshot (post-measure) ===` with per-actor lines
   reporting `files=<n> apparent=<bytes> disk=<bytes>` plus a
   `Δ(apparent=..., disk=..., files=...)` delta against the
-  post-prewarm snapshot. Stable totals are the coarse fallback signal
-  that vector-partition L1 eviction did not produce extra L2 writes.
+  post-prewarm snapshot. Stable totals confirm query traffic did not
+  trigger extra L2 writes (no L1→L2 writeback for vector partitions). A
+  `tombstones_added=True` field appended to the delta is a hard error:
+  it means an invalidation rename hit the failure path and the v6
+  backend wrote a tombstone so future opens of that prefix skip it.
 
 ### Partition residency verification
 
-> **v6 port — disabled for `--scenario distributed`.** The
-> per-partition residency probe calls v4
-> `prewarm_vector_cache(name, [p], policy='moka_ram_cap', ram_bytes=0)`
-> as a no-load probe; Lance 6.0 has no equivalent and the driver skips
-> the probe for the distributed scenario. The expected console blocks
-> and `<out-dir>/partition_residency.jsonl` described below apply to
-> the v4 `--scenario hybrid` path only. See
-> [`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md)
-> ("Residency probe") for the aggregate-only v6 replacement.
+The residency probe is eligible whenever `--prewarm` is `forced` or
+`sharded` and `--scenario` is not `no-cache` — the v6 aggregate-only
+report needs a defined per-actor expected partition set (full range
+for `forced`, round-robin slice for `sharded`) and an L2 tier (any
+scenario except `no-cache`). It fires for `distributed` (the scenario
+it was designed for) and for `moka` (where the L2 half is trivially
+empty and the row is dominated by `l1_size_bytes_at_probe`).
 
-Under v4 the post-measure probe always ran for hybrid actors: it fires
-after the measured workload, so it cannot perturb the measurement, and
-it is the only block written to `<out-dir>/partition_residency.jsonl`.
-The probe called Lance's
-`prewarm_vector_cache(name, [p], policy='moka_ram_cap', ram_bytes=0)`
-once per owned partition: pass 1 charged DRAM-resident
-partitions into `skipped_existing`, pass 2 short-circuited on
-`ram_bytes_deep_size >= ram_bytes` (i.e. `0 >= 0`) before loading
-anything — no storage read either way.
+The post-measure probe fires after the measured workload, so it cannot
+perturb the measurement, and it is the only block written to
+`<out-dir>/partition_residency.jsonl` by default. It walks each actor's
+L2 directory under `{l2_dir}/v1/{sanitize(prefix)}/` and counts the
+`part-ivf-{id}.bin` files — file presence one-to-one maps to L2
+residency under the v6 layout, so the report needs no inference and
+gives no false positives. The walk runs on the actor process (via
+`HybridSearchActor.check_l2_residency.remote(...)`) so it sees the
+actor node's local NVMe; a driver-side walk would see an empty path
+in a multi-node topology. The walk is scoped to a single live prefix
+under `v1/`: if exactly one non-`.deleting-` subdir exists it is the
+target; if two or more coexist (e.g. a stale prefix from an earlier
+bench run sharing the same L2 path) the row is reported with empty
+`in_l2`, full `missing`, and the conflicting names listed in
+`l2_prefix_dirs` so the operator notices instead of seeing a stale-
+prefix-masked "healthy" report. The L1 half is a session-wide
+`Session.size_bytes()` readout, returned in the same RPC (Lance 6.0
+has no no-load L1 probe).
 
-Adding `--pre-measure-residency-probe` enabled a second probe between
-prewarm and measure. The flag was opt-in because the probe is no-*load*
-but not no-*touch*: it walks the cache access path once per owned
-partition immediately before the measured workload, which can shift
-replacement-policy state (recency / frequency / admission). The
-hit/miss counter subtraction in the measure phase canceled the count
-bump but not that policy bump, so by default the cache between prewarm
-and measure was left untouched. With the flag set, both probes were
+Adding `--pre-measure-residency-probe` enables a second probe between
+prewarm and measure. The flag is opt-in mainly for symmetry with the
+v4 narrative — the v6 probe is a filesystem walk plus one
+`Session.size_bytes()` read per actor, both returned in a single RPC,
+no cache access path involved. With the flag set, both probes are
 written to `<out-dir>/partition_residency.jsonl`, one JSON line per
-actor per probe, with a `"label"` field of `"post-prewarm"` or `"post-measure"`
-so downstream tooling can demux.
+actor per probe, with a `"label"` field of `"post-prewarm"` or
+`"post-measure"` so downstream tooling can demux.
 
-Each line carries the full sorted lists of in-RAM and not-in-RAM
-partition ids, the session-level cache footprint (under v6 the
-`session_stats` field is `{"size_bytes": int}` from `Session.size_bytes()`;
-under the v4 hybrid path it was the dict returned by the now-removed
-`index_cache_stats()`), and (for the v4 hybrid path) the per-actor L2
-directory footprint.
+Each row carries:
 
-Per-partition L2 residency is not yet surfaced by pylance (the underlying
-Rust helpers `partition_is_cached` / `partition_is_in_l2` exist but are
-not bound). Until the binding lands, hybrid reports set
-`l2_residency_source="prewarm_validated_owned_set"` and fill `in_l2` from
-each actor's owned partition slice. This is a safe default because
-deterministic `hybrid_tiered` prewarm with `wait_for_disk=True` places
-every owned partition in L2 by construction and the
-no-vector-L1-writeback policy means subsequent query traffic cannot
-remove a partition from L2. Cross-reference `in_l2` against the
-prewarm-time `loaded_to_disk + skipped_existing` count and the per-actor
-L2 directory footprint: stable byte/file totals across the measurement
-phase confirm no extra L2 writes occurred, and any growth there warrants
-investigation. The driver's pre/post L2 snapshot delta block surfaces
-this directly.
+| Field | Meaning |
+|---|---|
+| `actor_id` | Driver-assigned actor index. |
+| `label` | `post-prewarm` or `post-measure`. |
+| `owned_count` | Partitions the actor was expected to cache. |
+| `in_l2` | Sorted partition ids found on disk (intersected with the owned slice). |
+| `missing` | Owned partitions not on disk. |
+| `l2_size_bytes_total` | Sum of apparent bytes across `part-ivf-{id}.bin` files in the active prefix dir. |
+| `l2_file_count` | Number of partition files on disk in the active prefix dir. |
+| `l2_prefix_dirs` | Sorted live (non-`.deleting-`) prefix subdirs under `v1/`. Length > 1 means the residency claim was refused due to stale-prefix ambiguity. |
+| `l1_size_bytes_at_probe` | `Session.size_bytes()` at probe time; `-1` when the cluster is no longer reachable. |
+| `probe_duration_s` | Wall-time of the walk + RPC. |
+
+The v4 per-partition `in_l1` / `not_in_l1` lists, the `in_ram` /
+`not_in_ram` aliases, and the `l2_residency_source` field are gone.
+The driver's pre/post L2 directory snapshot delta block (above)
+surfaces unexpected L2 growth and any new tombstones
+(`tombstones_added=True` is a hard error from a failed invalidation
+rename).
 
 The same probe is exposed as a standalone script that can attach to a
 live Ray cluster while the bench's actors are still alive — useful for
 ad-hoc snapshots between phases or after manual experiments:
 
 ```bash
-python -u check_partition_residency.py \
+python -u check_l2_residency.py \
     --num-actors 2 --num-partitions 3000 \
-    --index-name vector_idx \
     --nvme-dir /mnt/nvme/lance-l2/distributed \
     --label adhoc \
     --out out/hybrid-real-2actors/partition_residency.jsonl
 ```
 
 The script resolves the bench's named actors (`hybrid-search-actor-<i>`)
-via `ray.get_actor(...)`, so it only works during a run where the
-driver's actors have not yet been killed.
+via `ray.get_actor(...)` to fetch `Session.size_bytes()`; pass
+`--no-attach` for an L2-walk-only report (`l1_size_bytes_at_probe` is
+then reported as `-1`). `--help` and `--no-attach` work in environments
+without ray installed — the ray import is deferred to the attach path.
 
 ### Legacy: `--prewarm-ram-fraction` and the foyer `spilled` column
 

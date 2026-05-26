@@ -312,14 +312,28 @@ and per-actor rows; per-actor cache footprint is the v6
 `Session.size_bytes()` value (the v4 hit-ratio columns are gone — Lance
 6.0 does not expose hit/miss counters). `<out-dir>/distributed_results.jsonl`
 has one record
-per actor. For sharded `moka` and `hybrid` runs, the driver also writes
+per actor. Whenever `--prewarm` is `forced` or `sharded` and
+`--scenario` is not `no-cache`, the driver also writes
 `<out-dir>/partition_residency.jsonl` after measurement; with
 `--pre-measure-residency-probe`, the same file contains both `post-prewarm`
-and `post-measure` labels so you can compare cache movement across the query
-run. Residency rows include `l2_residency_source` in JSON and `l2_source=...`
-in console output, so the report distinguishes an eventual bound L2 index probe
-from today's hybrid `prewarm_validated_owned_set` source plus L2 directory
-snapshot cross-check.
+and `post-measure` labels so you can compare cache movement across the
+query run. The walk happens on the actor via Ray RPC so it works in
+real-cluster topologies where each actor's L2 dir is on local NVMe.
+Residency rows carry the v6 aggregate-only schema:
+`owned_count`, `in_l2`, `missing`, `l2_size_bytes_total`, `l2_file_count`,
+`l2_prefix_dirs`, and `l1_size_bytes_at_probe` (from `Session.size_bytes()`).
+The L2 half is exact under v6 — file presence under
+`{l2_dir}/v1/{sanitize(prefix)}/part-ivf-{id}.bin` one-to-one maps to
+L2 residency, so the v4 `l2_residency_source` / `prewarm_validated_owned_set`
+inference fields are gone. The walk is scoped to a single live prefix
+dir under `v1/`; if two or more coexist (e.g. a stale dir from a
+previous bench shares the L2 path) the residency claim is refused
+(`in_l2=[]`, `missing=owned`) and the conflicting names are listed in
+`l2_prefix_dirs` so the operator notices instead of seeing a false
+"healthy" report. The L1 half is reported as a session-wide byte total
+rather than per-partition identity — Lance 6.0 has no no-load L1 probe
+(the v4 `in_l1` / `not_in_l1` lists are dropped). See
+[`check_l2_residency.py`](check_l2_residency.py) for the walk + schema.
 
 Caveats:
 
