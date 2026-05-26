@@ -93,8 +93,12 @@ class HybridSearchActor:
         # `{l2_dir}/lance-distributed.lock` and rejects a missing dir.
         # Create the per-actor dir in-process — driver-side mkdir would
         # only see the head-node filesystem in a multi-node cluster.
+        # Stashed on the actor so the sharded-prewarm L2 file-count
+        # validation can walk it without the driver re-sending the path.
+        self._l2_dir: str | None = None
         if spec.get("kind") == "distributed":
-            _os.makedirs(spec["l2_dir"], exist_ok=True)
+            self._l2_dir = str(spec["l2_dir"])
+            _os.makedirs(self._l2_dir, exist_ok=True)
         self._sess = build_session(spec)
         self._ds = lance.dataset(
             uri,
@@ -110,6 +114,55 @@ class HybridSearchActor:
         # report fan-out balance per actor without timing them inside
         # the worker (the coord owns per-query latency).
         self._n_searches_handled: int = 0
+
+    def _validate_l2_partition_files(self, expected_ids: List[int]) -> Dict[str, Any]:
+        """Walk the actor-local L2 dir to verify sharded prewarm placement.
+
+        v6's ``dataset.prewarm_index(name, partition_ids=...)`` returns
+        ``None`` and either succeeds for every requested partition or
+        raises ``LanceError``; the on-disk ``part-ivf-{id}.bin`` files
+        under ``{l2_dir}/v1/{sanitize(prefix)}/`` are the only
+        Python-visible placement signal. A mismatch here flags a
+        backend regression, a stale-prefix collision (two live
+        ``v1/{prefix}/`` subdirs), or a write that silently dropped
+        despite the strict path.
+
+        Returns ``{}`` for non-distributed sessions (no L2 tier to
+        walk). For distributed sessions the dict carries the observed
+        file count, on-disk apparent bytes, the count of partitions
+        missing from disk (``missing_count``), unexpected partitions
+        found (``extra_count``), and capped previews of the missing /
+        extra id sets so a non-zero count is investigable from the
+        driver log without a follow-up RPC.
+        """
+        if self._l2_dir is None:
+            return {}
+        # Local import: keeps the helper module out of the actor's
+        # eager-import path for moka / no-cache scenarios that don't
+        # touch the L2 tier.
+        from check_l2_residency import walk_l2_partition_ids
+
+        found_ids, file_count, apparent_bytes, prefix_dirs = walk_l2_partition_ids(
+            self._l2_dir
+        )
+        found_set = set(found_ids)
+        expected_set = {int(p) for p in expected_ids}
+        missing = sorted(expected_set - found_set)
+        extra = sorted(found_set - expected_set)
+        return {
+            "l2_file_count": int(file_count),
+            "l2_apparent_bytes": int(apparent_bytes),
+            "expected_count": len(expected_set),
+            "missing_count": len(missing),
+            "extra_count": len(extra),
+            # Cap the printed sets — full lists clutter the ray log on
+            # large indexes (3000 partitions per actor is common). The
+            # full diff can be reconstructed from a snapshot_l2_dir
+            # call if a non-zero count fires.
+            "missing": missing[:32],
+            "extra": extra[:32],
+            "l2_prefix_dirs": prefix_dirs,
+        }
 
     def prewarm_index(self, index_name: str) -> Dict[str, Any]:
         """Force every partition of the named index into the cache.
@@ -153,6 +206,14 @@ class HybridSearchActor:
         and raises ``LanceError`` on any L2 write failure / mid-prewarm
         generation change. The v4 ``policy='normal'`` knob is gone in
         v6; the distributed cache controls placement itself.
+
+        Returns an ``l2_validation`` block (``{}`` for non-distributed
+        sessions) that walks the actor-local L2 dir post-prewarm and
+        reports ``l2_file_count`` / ``missing_count`` / ``extra_count``
+        against the expected partition set. The driver should hard-fail
+        on ``missing_count != 0`` — the v6 strict path either persisted
+        every requested partition or raised ``LanceError``, so a
+        survivor with missing files is a backend regression.
         """
         if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
@@ -172,6 +233,7 @@ class HybridSearchActor:
             "n_partitions": len(self._owned_partitions),
             "duration_s": time.time() - t0,
             "stats_post_prewarm": self._size_bytes_stats(self._sess),
+            "l2_validation": self._validate_l2_partition_files(unique_ids),
         }
 
     def prewarm_partitions_deterministic(
@@ -197,8 +259,13 @@ class HybridSearchActor:
         no L1 capacity-bookkeeping knob, and persists each partition
         atomically (rename + fsync) so there is no separate
         "wait for disk" gate. The returned ``prewarm_stats`` dict is
-        empty (no v6 counter binding); downstream code should rely on
-        the L2 directory snapshot for placement verification.
+        empty (no v6 counter binding); the ``l2_validation`` block
+        (populated for distributed sessions only) is the v6 analog of
+        the v4 counter check: it walks the actor-local L2 dir and
+        verifies that ``part-ivf-{id}.bin`` exists for every requested
+        partition. ``missing_count != 0`` is a hard-fail signal for the
+        driver. Non-distributed sessions return an empty dict (no L2
+        tier).
         """
         if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
@@ -218,6 +285,7 @@ class HybridSearchActor:
             "prewarm_stats": {},
             "policy": policy,
             "ram_bytes_budget": int(ram_bytes),
+            "l2_validation": self._validate_l2_partition_files(unique_ids),
         }
 
     def set_owned_partitions(
@@ -288,9 +356,7 @@ class HybridSearchActor:
             l1_size_bytes=l1_size,
         )
 
-    def warmup_natural(
-        self, queries: List[List[float]], k: int = 10
-    ) -> Dict[str, Any]:
+    def warmup_natural(self, queries: List[List[float]], k: int = 10) -> Dict[str, Any]:
         """Run a slice of representative queries to populate the cache.
 
         Equivalent to `_hybrid_cache_helpers.warmup` but takes
@@ -360,11 +426,22 @@ class HybridSearchActor:
                 "measure_sharded called before prewarm_partitions; "
                 "the actor has no owned-partition slice to search"
             )
-        if not hasattr(self._ds, "search_partitions"):
+        # Both APIs are required: routing calls compute_partition_ids
+        # (centroid-only) and the per-query partial search calls
+        # search_partitions. Gate them together so a pylance build that
+        # ships only one of the two fails before the measure loop starts,
+        # rather than partway through with a misleading AttributeError on
+        # the second call.
+        missing_apis = [
+            name
+            for name in ("compute_partition_ids", "search_partitions")
+            if not hasattr(self._ds, name)
+        ]
+        if missing_apis:
             raise RuntimeError(
-                "this pylance build does not expose dataset.search_partitions; "
-                "needs the partition-sharded IVF primitives "
-                "(lance commit 4078a83b or later)"
+                "this pylance build does not expose dataset."
+                f"{' / dataset.'.join(missing_apis)}; needs the partition-"
+                "sharded IVF primitives (lance commit 4078a83b or later)"
             )
 
         results: Dict[int, List[float]] = {k: [] for k in k_list}
@@ -454,146 +531,6 @@ class HybridSearchActor:
             "n_searches_handled": int(self._n_searches_handled),
             "owned_partitions": len(self._owned_partitions),
         }
-
-    def check_partition_residency(
-        self,
-        index_name: str,
-        partition_ids: List[int] | None = None,
-        l2_dir: str | None = None,
-    ) -> Dict[str, Any]:
-        """Probe owned partitions for L1 (and, when bound, L2) residency
-        without side effects.
-
-        L1 probe — ``IvfIndexSearcher::partition_is_cached`` is not yet
-        bound in pylance, so we use ``prewarm_vector_cache`` with
-        ``policy='moka_ram_cap', ram_bytes=0`` as a no-load equivalent:
-        pass 1 counts every DRAM-resident partition in
-        ``skipped_existing``, pass 2 short-circuits on
-        ``ram_bytes_deep_size >= ram_bytes`` (i.e. ``0 >= 0``) and never
-        loads anything. Single-partition probes therefore tell us, for
-        each id, whether it is currently in the foyer L1 (DRAM) tier.
-
-        L2 probe — ``partition_is_in_l2`` exists in the Rust IVF
-        searcher but is not yet bound to Python. Without it the result
-        defers L2 status to the actor's own bookkeeping: when the
-        actor has just been hybrid-prewarmed with
-        ``policy='hybrid_tiered', wait_for_disk=True`` every owned
-        partition is on L2 by construction, so ``in_l2`` is filled
-        with ``self._owned_partitions`` for hybrid sessions. The L2
-        directory snapshot is included as a coarse cross-check (file
-        count + on-disk bytes) — see ``l2_inspect.py`` for why this
-        only catches *visible* growth and file-count churn, not silent
-        block overwrites. When per-partition L2 residency is later
-        bound this method should switch ``in_l2`` and ``missing`` to
-        the bound probe; the field shape is stable today.
-
-        Result fields:
-
-        * ``in_l1`` — partition ids confirmed L1-resident.
-        * ``not_in_l1`` — owned partitions not currently in L1 (would
-          incur an L2 read on next query if hybrid, else MinIO).
-        * ``in_l2`` — partitions known L2-resident. For hybrid sessions
-          with a pylance build that lacks ``partition_is_in_l2`` this
-          defaults to every owned partition (post-prewarm assumption);
-          for non-hybrid actors it is empty.
-        * ``missing`` — partitions neither L1- nor L2-resident. Without
-          a bound L2 probe this is always empty for hybrid actors
-          (rely on the L2 directory snapshot + prewarm validation to
-          catch missing L2 placement). For no-L2 sessions (Moka /
-          no-cache) anything not in L1 is missing from cache entirely,
-          so this equals ``not_in_l1``.
-        * ``l2_probe_supported`` — false until the Python binding
-          lands, so downstream tooling can demote ``in_l2`` /
-          ``missing`` to inferred-only values.
-        * ``l2_residency_source`` — how ``in_l2`` / ``missing`` were
-          derived. Today this is ``prewarm_validated_owned_set`` for
-          hybrid actors (prewarm counters validate ownership, the L2 dir
-          snapshot cross-checks filesystem footprint) or ``no_l2_tier``
-          for Moka / no-cache actors. Switch to ``index_probe`` when a
-          pylance L2 binding lands.
-
-        Backwards compatibility: ``in_ram`` / ``not_in_ram`` are kept as
-        aliases for ``in_l1`` / ``not_in_l1`` for callers that still
-        consume the old field names. Remove once no caller references
-        them.
-
-        Parameters
-        ----------
-        index_name : str
-            The IVF index name whose partitions are probed.
-        partition_ids : list of int, optional
-            Partitions to probe. Defaults to ``self._owned_partitions``
-            (set by ``prewarm_partitions_deterministic`` /
-            ``set_owned_partitions``). The probe is no-side-effect on
-            DRAM residency but still iterates per id, so callers can
-            restrict the probe range when ownership is large.
-        l2_dir : str, optional
-            Actor-local L2 directory to snapshot. When omitted the L2
-            footprint section of the result is empty (Moka actors have
-            no L2 dir).
-        """
-        if partition_ids is None:
-            partition_ids = sorted(self._owned_partitions)
-        else:
-            partition_ids = [int(p) for p in partition_ids]
-
-        in_l1: List[int] = []
-        not_in_l1: List[int] = []
-        t0 = time.time()
-        for p in partition_ids:
-            stats = self._ds.prewarm_vector_cache(
-                index_name,
-                [int(p)],
-                policy="moka_ram_cap",
-                ram_bytes=0,
-                wait_for_disk=False,
-            )
-            if int(stats.get("skipped_existing", 0)) >= 1:
-                in_l1.append(int(p))
-            else:
-                not_in_l1.append(int(p))
-
-        # Per-partition L2 probe is not bound to Python yet. For hybrid
-        # actors, assume every owned partition is L2-resident — the
-        # post-prewarm L2 directory snapshot and the prewarm-time
-        # loaded_to_disk + skipped_existing validation in the driver
-        # are the real disk-placement check. Moka / no-cache actors
-        # have no L2 tier, so anything not in L1 is missing from cache
-        # entirely (e.g. partitions dropped once moka_ram_cap fills).
-        l2_probe_supported = False
-        if l2_dir is not None:
-            in_l2 = [int(p) for p in partition_ids]
-            missing: List[int] = []
-            l2_residency_source = "prewarm_validated_owned_set"
-        else:
-            in_l2 = []
-            missing = list(not_in_l1)
-            l2_residency_source = "no_l2_tier"
-
-        result: Dict[str, Any] = {
-            "actor_id": self._actor_id,
-            "index_name": index_name,
-            "n_probed": len(partition_ids),
-            "in_l1": in_l1,
-            "not_in_l1": not_in_l1,
-            "in_l2": in_l2,
-            "missing": missing,
-            "l2_probe_supported": l2_probe_supported,
-            "l2_residency_source": l2_residency_source,
-            # Aliases retained for backward compatibility with older
-            # callers; remove once everything reads in_l1/not_in_l1.
-            "in_ram": in_l1,
-            "not_in_ram": not_in_l1,
-            "session_stats": self._size_bytes_stats(self._sess),
-            "probe_duration_s": time.time() - t0,
-        }
-        if l2_dir is not None:
-            from l2_inspect import snapshot_l2_dir as _snapshot
-
-            snap = _snapshot(l2_dir)
-            snap.pop("files", None)
-            result["l2_dir"] = snap
-        return result
 
     def close(self) -> None:
         """Release session resources and the L2 directory flock.
@@ -732,9 +669,7 @@ class CoordinatorActor:
 
                 # 2. Scatter to non-empty buckets in parallel.
                 t1 = time.perf_counter()
-                non_empty = [
-                    (i, ids) for i, ids in enumerate(buckets) if ids
-                ]
+                non_empty = [(i, ids) for i, ids in enumerate(buckets) if ids]
                 futures = [
                     self._workers[i].search_partitions.remote(qa, ids, k)
                     for i, ids in non_empty
@@ -752,9 +687,7 @@ class CoordinatorActor:
                 scatter_latencies.append(t_scatter)
                 merge_latencies.append(t_merge)
                 n_workers_invoked.append(len(non_empty))
-                n_owned_routed.append(
-                    sum(len(ids) for _, ids in non_empty)
-                )
+                n_owned_routed.append(sum(len(ids) for _, ids in non_empty))
 
         return {
             "latencies_by_k": {int(k): v for k, v in results.items()},

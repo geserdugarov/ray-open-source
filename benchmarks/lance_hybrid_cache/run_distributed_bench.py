@@ -19,17 +19,18 @@ Differences from `run_bench.py`:
   `run_bench.py`'s natural warmup does not exercise.
 * Adds `--prewarm sharded` which assigns disjoint partition slices to
   actors (round-robin `partition_id % num_actors`) and routes each actor
-  through `dataset.prewarm_vector_cache(...)` with a deterministic
-  placement policy picked from `--scenario`: `hybrid_tiered` places every
-  owned vector partition into L2 and intentionally leaves foyer L1 cold
-  (DRAM is filled later by ordinary query traffic promoting decoded
-  partitions out of L2 — there is no L1→L2 writeback for vector
-  partitions); `moka_ram_cap` loads until `--dram-gb` is full and stops;
-  `no-cache` is a no-op that just registers ownership. Per-actor prewarm
-  cost stays flat as `--num-actors` grows, but per-query recall becomes
-  partial in `--mode replicated` since results are not merged across
-  actors — this is a benchmark of the per-actor primitives, not of
-  full-recall cluster search.
+  through the v6 strict `dataset.prewarm_index(name, partition_ids=...)`
+  path. For `--scenario distributed` that writes one
+  `part-ivf-<id>.bin` per partition under `{l2_dir}/v1/{prefix}/`
+  atomically; the actor walks the L2 dir post-prewarm and the driver
+  hard-fails on any missing / extra partitions vs. the expected slice.
+  For `--scenario no-cache` the call is a no-op that only registers
+  ownership. The v4 `policy` / `ram_bytes` knobs (`hybrid_tiered`,
+  `moka_ram_cap`) are gone — the v6 distributed cache controls
+  placement itself. Per-actor prewarm cost stays flat as `--num-actors`
+  grows; per-query recall is partial under `--mode replicated` since
+  results are not merged across actors. Use `--mode sharded` for full
+  recall via the coordinator topology.
 * Adds `--mode sharded` which spins up a `CoordinatorActor` to scatter-
   gather `search_partitions` across the same partition-sharded workers
   and merge per-query top-K — full recall, with the slowest fan-out leg
@@ -144,6 +145,49 @@ def _post_prewarm_l1_baseline(
             "inferred zero from hybrid_tiered prewarm",
         )
     return {}, None
+
+
+def _assert_l2_validation_clean(prewarm_results: List[Dict[str, Any]]) -> None:
+    """Hard-fail the run if any actor's sharded prewarm dropped L2 files.
+
+    ``HybridSearchActor.prewarm_partitions_deterministic`` returns an
+    ``l2_validation`` block per actor (empty for non-distributed
+    sessions, which carry no L2 tier). For distributed sessions the v6
+    strict ``dataset.prewarm_index(name, partition_ids=...)`` path
+    either persisted every requested partition or raised
+    ``LanceError`` — so any non-zero ``missing_count`` here is a backend
+    regression and must abort the run rather than continue into a
+    measure phase that would silently scan partitions still served
+    from MinIO. ``extra_count != 0`` flags a stale-prefix collision
+    (two live ``v1/{prefix}/`` subdirs at the same ``l2_dir``); equally
+    fatal because the residency probe later refuses to claim a
+    residency under that ambiguity.
+    """
+    failures: List[str] = []
+    for r in prewarm_results:
+        v = r.get("l2_validation") or {}
+        if not v:
+            continue
+        actor_id = r.get("actor_id", "?")
+        missing = int(v.get("missing_count", 0))
+        extra = int(v.get("extra_count", 0))
+        expected = int(v.get("expected_count", 0))
+        file_count = int(v.get("l2_file_count", 0))
+        if missing or extra or file_count < expected:
+            failures.append(
+                f"actor={actor_id} expected={expected} "
+                f"l2_files={file_count} missing={missing} extra={extra} "
+                f"missing_sample={v.get('missing', [])[:8]} "
+                f"extra_sample={v.get('extra', [])[:8]} "
+                f"prefix_dirs={v.get('l2_prefix_dirs', [])}"
+            )
+    if failures:
+        raise RuntimeError(
+            "L2 placement check failed after sharded prewarm — the v6 "
+            "strict prewarm_index path should persist every requested "
+            "partition or raise LanceError; "
+            f"{len(failures)} actor(s) reported drift:\n  " + "\n  ".join(failures)
+        )
 
 
 def _nonneg_int(value: str) -> int:
@@ -287,15 +331,18 @@ def parse_args() -> argparse.Namespace:
             "natural=split warmup queries across actors; "
             "forced=every actor calls dataset.prewarm_index(...) in parallel; "
             "sharded=actor i deterministically prewarms partitions "
-            "{i, i+N, i+2N, ...} via dataset.prewarm_vector_cache(...) "
-            "with policy chosen from --scenario: hybrid_tiered for "
-            "--scenario hybrid (places every owned partition into L2 "
-            "and leaves foyer L1 cold — query traffic later promotes "
-            "decoded partitions out of L2 into volatile L1, with no L1→L2 "
-            "writeback path for vector partitions), moka_ram_cap for "
-            "--scenario moka (load until --dram-gb is full, then stop), "
-            "no-op for --scenario no-cache (registers ownership only). "
-            "The measure phase uses search_partitions over each actor's "
+            "{i, i+N, i+2N, ...} via the v6 strict "
+            "dataset.prewarm_index(name, partition_ids=...) path. For "
+            "--scenario distributed the strict path writes one "
+            "part-ivf-<id>.bin per partition under {l2_dir}/v1/{prefix}/ "
+            "atomically (LanceError on any L2 write failure / mid-prewarm "
+            "generation change); the actor walks the L2 dir post-prewarm "
+            "and the driver hard-fails on any missing/extra partitions "
+            "vs the expected slice. For --scenario no-cache it is a "
+            "no-op that only registers ownership. The v4 placement "
+            "policy knobs (hybrid_tiered, moka_ram_cap) are gone in v6 "
+            "— the distributed cache controls placement itself. The "
+            "measure phase uses search_partitions over each actor's "
             "owned slice (per-query partial recall — see README); "
             "none=skip prewarm entirely (cold first query)."
         ),
@@ -325,22 +372,19 @@ def parse_args() -> argparse.Namespace:
         "--pre-measure-residency-probe",
         action="store_true",
         help=(
-            "Run the per-partition DRAM residency probe between prewarm "
-            "and measure. Off by default: although the probe is no-load "
-            "(prewarm_vector_cache with ram_bytes=0 short-circuits before "
-            "any storage read), it still goes through the cache access "
-            "path once per owned partition, which can shift the "
-            "replacement-policy state (recency/frequency/admission) "
-            "immediately before the measured workload — the counter "
-            "subtraction in the measure phase does not undo that. Enable "
-            "only when investigating prewarm placement and you accept "
-            "that the measure phase observes a post-residency-scan cache "
-            "rather than the raw post-prewarm cache. The post-measure "
-            "probe (after queries) is always run for sharded non-no-cache "
-            "scenarios since it cannot pollute the measurement. When this "
-            "flag is off, the printed residency-shift comparison uses the "
-            "known cold-L1 baseline for hybrid_tiered prewarm and is "
-            "skipped for moka because there is no pre-measure L1 snapshot."
+            "Also run the v6 aggregate-only residency probe between "
+            "prewarm and measure. Off by default for symmetry with the "
+            "v4 narrative: the probe itself is side-effect-free under "
+            "v6 (one filesystem walk under {l2_dir}/v1/{prefix}/ plus "
+            "Session.size_bytes() per actor, returned in a single RPC), "
+            "but a single flag controls both the pre-measure and the "
+            "post-measure probes so they are written symmetrically to "
+            "partition_residency.jsonl. The v4 no-load per-partition L1 "
+            "probe has no v6 equivalent — the L2 directory walk plus "
+            "aggregate Session.size_bytes() is the replacement. The "
+            "post-measure probe always runs for forced/sharded prewarm "
+            "with --scenario other than no-cache because it cannot "
+            "pollute the measurement."
         ),
     )
 
@@ -473,31 +517,15 @@ def main() -> int:
     # 'distributed' (matching the spec dict's `kind` from build_session).
     args.scenario = _normalize_scenario_alias(args.scenario)
 
-    # Lance 6.0 distributed-cache port: anything that routes through
-    # `measure_sharded` (the per-actor partial-recall measure path) or
-    # `CoordinatorActor` (the full-recall topology) needs PyO3 wrappers
-    # for `Dataset.compute_partition_ids` / `Dataset.search_partitions`,
-    # which are Rust-only at the pinned v6 commit. Hard-fail both
-    # configurations at startup rather than crash deep inside the
-    # measure phase. `--mode sharded` forces `--prewarm sharded` later
-    # in main(), and `--prewarm sharded` dispatches `measure_sharded`
-    # under `--mode replicated` (line ~909), so guarding *both* flags
-    # here covers every entry point.
-    if args.mode == "sharded" or args.prewarm == "sharded":
-        offending = "--mode sharded" if args.mode == "sharded" else "--prewarm sharded"
-        print(
-            f"[driver] {offending} is not yet ported to Lance 6.0: the "
-            "sharded measure path requires PyO3 wrappers for "
-            "`Dataset.compute_partition_ids` / `Dataset.search_partitions`, "
-            "which are Rust-only at the pinned Lance 6.0 commit. Use "
-            "`--mode replicated` with `--prewarm forced` (every actor "
-            "calls dataset.prewarm_index in parallel), `--prewarm "
-            "natural`, or `--prewarm none` instead. See "
-            "plans/benchmark/lance-distributed-cache-6.0.md "
-            "(\"Sharded-mode port BLOCKED\") for the unblock options.",
-            file=sys.stderr,
-        )
-        return 2
+    # Lance 6.0 distributed-cache port: `measure_sharded` and
+    # `CoordinatorActor` depend on the Python `compute_partition_ids` /
+    # `search_partitions` APIs. Per the issue body those APIs are
+    # treated as verified; the driver no longer pre-blocks the path. The
+    # actor (`HybridSearchActor.measure_sharded`,
+    # `HybridSearchActor.search_partitions`, `CoordinatorActor.__init__`)
+    # gates each call via ``hasattr`` and raises a clear error if a
+    # pylance build is missing them — failing in the actor on the first
+    # use rather than after a misleading driver-side allow.
 
     # Coord mode is meaningless without a sharded prewarm — the
     # coordinator routes to actors based on partition ownership, and
@@ -506,8 +534,7 @@ def main() -> int:
     # partitions they're being asked about.
     if args.mode == "sharded" and args.prewarm != "sharded":
         print(
-            f"[driver] --mode=sharded forces --prewarm=sharded "
-            f"(was {args.prewarm!r})"
+            f"[driver] --mode=sharded forces --prewarm=sharded (was {args.prewarm!r})"
         )
         args.prewarm = "sharded"
 
@@ -759,6 +786,12 @@ def main() -> int:
                 ]
             )
             print(f"[driver] sharded prewarm done in {time.time() - t0:.1f}s")
+            # Hard-fail before measure if any actor's L2 dir is missing
+            # files for partitions the strict v6 path was supposed to
+            # persist. Done before the per-actor status print so the
+            # traceback carries the missing/extra partition samples and
+            # is the first thing the operator sees.
+            _assert_l2_validation_clean(prewarm_results)
             for r in prewarm_results:
                 s = r["stats_post_prewarm"]
                 ps = r["prewarm_stats"]
@@ -773,13 +806,16 @@ def main() -> int:
                     # partition_ids=...)` returns no Python-visible
                     # counters; success means every requested partition
                     # was persisted to L2 atomically (or it raised
-                    # LanceError). The v4 loaded_to_ram / spills /
-                    # loaded_to_disk validation does not apply — placement
-                    # verification is via the L2 directory snapshot in
-                    # the phase below.
+                    # LanceError). The L2 file-count cross-check
+                    # (verified by `_assert_l2_validation_clean` above)
+                    # is the v6 analog of the v4 counter check; surface
+                    # the count here so a successful run still prints
+                    # how many `part-ivf-<id>.bin` files landed.
+                    v = r.get("l2_validation") or {}
                     print(
                         f"  actor={r['actor_id']} prewarm={r['duration_s']:.1f}s "
                         f"owned={owned_n} "
+                        f"l2_files={int(v.get('l2_file_count', 0))} "
                         f"cache_bytes={s.get('size_bytes', '?'):,}"
                     )
                 else:
@@ -808,8 +844,7 @@ def main() -> int:
     actor_l2_dirs: List[str] = []
     if args.prewarm in ("sharded", "forced") and args.scenario == "distributed":
         actor_l2_dirs = [
-            os.path.join(args.nvme_dir, f"actor-{i}")
-            for i in range(args.num_actors)
+            os.path.join(args.nvme_dir, f"actor-{i}") for i in range(args.num_actors)
         ]
         post_prewarm_l2_snaps = ray.get(
             [
@@ -820,10 +855,7 @@ def main() -> int:
         print("[driver] L2 snapshot (post-prewarm):")
         for snap in post_prewarm_l2_snaps:
             if not snap.get("exists"):
-                print(
-                    f"  actor={snap['actor_id']} L2 dir missing "
-                    f"({snap.get('path')})"
-                )
+                print(f"  actor={snap['actor_id']} L2 dir missing ({snap.get('path')})")
                 continue
             print(
                 f"  actor={snap['actor_id']} L2 dir={snap['path']} "
@@ -887,9 +919,7 @@ def main() -> int:
     if residency_jsonl_path is not None:
         residency_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         residency_jsonl_path.write_text("")
-    residency_nvme_dir = (
-        args.nvme_dir if args.scenario == "distributed" else None
-    )
+    residency_nvme_dir = args.nvme_dir if args.scenario == "distributed" else None
     pre_measure_residency: List[Dict[str, Any]] = []
     if do_pre_residency_probe:
         pre_measure_residency = run_l2_residency_check(
@@ -967,10 +997,7 @@ def main() -> int:
         warmup_routing_q = make_query_vectors(1, args.dim, seed=args.seed + 3)[0]
         t_warm = time.time()
         ray.get(coord.warmup_routing.remote(warmup_routing_q.tolist()))
-        print(
-            f"[driver] coord routing warmup done in "
-            f"{time.time() - t_warm:.1f}s"
-        )
+        print(f"[driver] coord routing warmup done in {time.time() - t_warm:.1f}s")
         # No random-query warmup pass: deterministic sharded prewarm
         # already populated the codec-bearing IVF partition entries (the
         # dominant cache footprint) and the codec-less top-level vector
@@ -985,13 +1012,9 @@ def main() -> int:
                 f"queries)"
             )
         # v6: no hit/miss counters, so the v4 pre-measure baseline
-        # snapshot has nothing to subtract — dropped. (This branch is
-        # currently unreachable; `--mode sharded` hard-fails at startup,
-        # but the assignment is removed so ruff stays clean.)
+        # snapshot has nothing to subtract — dropped.
         t_measure_start = time.time()
-        coord_result = ray.get(
-            coord.search_batch.remote(measure_qs.tolist(), k_list)
-        )
+        coord_result = ray.get(coord.search_batch.remote(measure_qs.tolist(), k_list))
         measure_wall_s = time.time() - t_measure_start
         # Pull per-actor cache stats post-measure — coord doesn't have
         # them since it never touched partition data.
@@ -1121,9 +1144,7 @@ def main() -> int:
         for snap in post_measure_l2_snaps:
             aid = snap["actor_id"]
             if not snap.get("exists"):
-                print(
-                    f"  actor={aid} L2 dir missing ({snap.get('path')})"
-                )
+                print(f"  actor={aid} L2 dir missing ({snap.get('path')})")
                 continue
             pre = pre_by_id.get(aid)
             delta = diff_snapshots(pre, snap) if pre else {}
@@ -1141,8 +1162,7 @@ def main() -> int:
                 f"  actor={aid} L2 dir={snap['path']} "
                 f"files={snap['file_count']} "
                 f"apparent={format_bytes(int(snap['apparent_bytes']))} "
-                f"disk={format_bytes(int(snap['disk_bytes']))}"
-                + delta_str
+                f"disk={format_bytes(int(snap['disk_bytes']))}" + delta_str
             )
 
     # ── Phase 3: close + cleanup ──

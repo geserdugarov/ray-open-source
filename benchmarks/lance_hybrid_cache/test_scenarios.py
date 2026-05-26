@@ -68,12 +68,8 @@ from scenarios import (  # noqa: E402
 
 class PerActorL2DirTest(unittest.TestCase):
     def test_layout(self):
-        self.assertEqual(
-            per_actor_l2_dir("/mnt/nvme/l2", 0), "/mnt/nvme/l2/actor-0"
-        )
-        self.assertEqual(
-            per_actor_l2_dir("/mnt/nvme/l2", 7), "/mnt/nvme/l2/actor-7"
-        )
+        self.assertEqual(per_actor_l2_dir("/mnt/nvme/l2", 0), "/mnt/nvme/l2/actor-0")
+        self.assertEqual(per_actor_l2_dir("/mnt/nvme/l2", 7), "/mnt/nvme/l2/actor-7")
 
 
 class BuildScenarioSpecTest(unittest.TestCase):
@@ -84,9 +80,7 @@ class BuildScenarioSpecTest(unittest.TestCase):
         )
 
     def test_no_cache_passes_metadata_cache_size_through(self):
-        spec = build_scenario_spec(
-            "no-cache", 0, metadata_cache_size_bytes=8 * MIB
-        )
+        spec = build_scenario_spec("no-cache", 0, metadata_cache_size_bytes=8 * MIB)
         self.assertEqual(spec["metadata_cache_size_bytes"], 8 * MIB)
 
     def test_moka(self):
@@ -157,7 +151,9 @@ class BuildScenarioSpecsPluralShimTest(unittest.TestCase):
             dram_bytes=4 * GIB,
             nvme_dir="/mnt/nvme/l2",
         )
-        self.assertEqual([s["kind"] for s in specs], ["no-cache", "moka", "distributed"])
+        self.assertEqual(
+            [s["kind"] for s in specs], ["no-cache", "moka", "distributed"]
+        )
         self.assertEqual(specs[2]["l2_dir"], "/mnt/nvme/l2/actor-0")
 
     def test_distributed_pass_through(self):
@@ -702,23 +698,20 @@ class PlotResultsV6ColumnsTest(unittest.TestCase):
         # Parse the source to confirm the v4-only scenario filter is
         # gone. Inspecting source rather than running matplotlib keeps
         # the unit test dependency-free.
-        plot_src = (
-            Path(HERE) / "plot_results.py"
-        ).read_text()
+        plot_src = (Path(HERE) / "plot_results.py").read_text()
         # The broken line was a literal tuple containing only the v4
         # names. The fixed code references `preferred_order` (which
         # includes `distributed`) and accepts any scenario the CSV
         # carries.
         self.assertNotIn(
-            '("no-cache", "moka", "hybrid")', plot_src,
+            '("no-cache", "moka", "hybrid")',
+            plot_src,
             msg="plot_p99_bars still hard-codes the v4 scenario filter",
         )
         self.assertIn("distributed", plot_src)
 
     def test_hit_ratio_helper_removed_in_favor_of_l1_size(self):
-        plot_src = (
-            Path(HERE) / "plot_results.py"
-        ).read_text()
+        plot_src = (Path(HERE) / "plot_results.py").read_text()
         # The v4 hit_ratio panel read `df["hit_ratio"]`; that column
         # is gone from v6 `summary.csv`. The replacement is
         # `plot_l1_size`, which reads `session_size_bytes_*`.
@@ -770,6 +763,335 @@ class DistributedDriverAliasTest(unittest.TestCase):
         norm = self._load_helper()
         self.assertEqual(norm("moka"), "moka")
         self.assertEqual(norm("no-cache"), "no-cache")
+
+
+class _StubDataset:
+    """Minimal dataset stand-in used to exercise actor-method API gates.
+
+    Only carries the attributes the test asks for, so a test that sets
+    ``compute_partition_ids=None`` and omits ``search_partitions`` can
+    drive ``measure_sharded``'s ``hasattr`` checks deterministically.
+    """
+
+    def __init__(self, **attrs):
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
+def _make_actor_for_validation(l2_dir):
+    """Build a HybridSearchActor instance without running ``__init__``.
+
+    The full ``__init__`` opens a real Lance dataset over MinIO. The
+    L2-validation and API-gate tests only care about a small handful
+    of attributes; constructing via ``__new__`` and back-filling them
+    is faster and keeps the tests dependency-free.
+    """
+    # Stub the ``ray`` dependency before importing the actor module — it
+    # decorates ``HybridSearchActor`` with ``@ray.remote`` at import time.
+    if "ray" not in sys.modules:
+        _stub = types.ModuleType("ray")
+
+        def _remote(*a, **kw):
+            if len(a) == 1 and callable(a[0]):
+                return a[0]
+            return lambda c: c
+
+        _stub.remote = _remote
+        sys.modules["ray"] = _stub
+
+    import distributed_actor  # noqa: PLC0415
+
+    actor = distributed_actor.HybridSearchActor.__new__(
+        distributed_actor.HybridSearchActor
+    )
+    actor._actor_id = 0
+    actor._nprobes = 1
+    actor._size_bytes_stats = lambda s: {"size_bytes": 0}
+    actor._sess = object()
+    actor._owned_partitions = set()
+    actor._sharded_index_name = None
+    actor._n_searches_handled = 0
+    actor._l2_dir = l2_dir
+    return actor, distributed_actor
+
+
+class ValidateL2PartitionFilesTest(unittest.TestCase):
+    """``HybridSearchActor._validate_l2_partition_files`` walks
+    ``{l2_dir}/v1/{prefix}/part-ivf-{id}.bin`` and reports the
+    expected-vs-found set so the driver can hard-fail on placement
+    drift after the v6 strict prewarm path returns.
+    """
+
+    def test_returns_empty_for_non_distributed_session(self):
+        actor, _ = _make_actor_for_validation(l2_dir=None)
+        # No L2 tier (moka / no-cache): the validator must short-circuit
+        # to ``{}`` so the driver's distributed-only consumer can skip
+        # the block without keying into a partially-populated dict.
+        self.assertEqual(actor._validate_l2_partition_files([0, 1, 2]), {})
+
+    def test_reports_all_expected_files_found(self):
+        import tempfile  # noqa: PLC0415
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = _Path(tmp) / "v1" / "ds-vector_idx"
+            prefix.mkdir(parents=True)
+            for pid in (0, 2, 4):
+                (prefix / f"part-ivf-{pid}.bin").write_bytes(b"x" * 16)
+            actor, _ = _make_actor_for_validation(l2_dir=tmp)
+            result = actor._validate_l2_partition_files([0, 2, 4])
+        self.assertEqual(result["l2_file_count"], 3)
+        self.assertEqual(result["expected_count"], 3)
+        self.assertEqual(result["missing_count"], 0)
+        self.assertEqual(result["extra_count"], 0)
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(result["extra"], [])
+
+    def test_reports_missing_and_extra_partition_ids(self):
+        import tempfile  # noqa: PLC0415
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = _Path(tmp) / "v1" / "ds-vector_idx"
+            prefix.mkdir(parents=True)
+            # Expected {0, 2, 4}; disk has {2, 4, 7} — 0 missing, 7 extra.
+            for pid in (2, 4, 7):
+                (prefix / f"part-ivf-{pid}.bin").write_bytes(b"x")
+            actor, _ = _make_actor_for_validation(l2_dir=tmp)
+            result = actor._validate_l2_partition_files([0, 2, 4])
+        self.assertEqual(result["missing_count"], 1)
+        self.assertEqual(result["missing"], [0])
+        self.assertEqual(result["extra_count"], 1)
+        self.assertEqual(result["extra"], [7])
+
+    def test_missing_preview_capped_at_32(self):
+        # Large indexes have thousands of partitions; the actor caps the
+        # printed lists so a failure doesn't dump every partition id
+        # through the Ray log. Counts remain accurate.
+        import tempfile  # noqa: PLC0415
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        expected = list(range(100))
+        with tempfile.TemporaryDirectory() as tmp:
+            (_Path(tmp) / "v1" / "ds-vector_idx").mkdir(parents=True)
+            actor, _ = _make_actor_for_validation(l2_dir=tmp)
+            result = actor._validate_l2_partition_files(expected)
+        self.assertEqual(result["missing_count"], 100)
+        self.assertEqual(len(result["missing"]), 32)
+
+
+class MeasureShardedApiGateTest(unittest.TestCase):
+    """``HybridSearchActor.measure_sharded`` depends on BOTH
+    ``Dataset.compute_partition_ids`` and ``Dataset.search_partitions``.
+    The pre-loop gate must list every missing API so a pylance build
+    that ships only one of the two raises before the measure loop
+    starts.
+    """
+
+    def _ready_actor(self, ds_attrs):
+        actor, _ = _make_actor_for_validation(l2_dir=None)
+        actor._sharded_index_name = "vector_idx"
+        actor._owned_partitions = {0}
+        actor._ds = _StubDataset(**ds_attrs)
+        return actor
+
+    def test_missing_compute_partition_ids_raises(self):
+        actor = self._ready_actor(ds_attrs={"search_partitions": lambda *a, **kw: None})
+        with self.assertRaises(RuntimeError) as cm:
+            actor.measure_sharded(queries=[], k_list=[10])
+        self.assertIn("compute_partition_ids", str(cm.exception))
+        self.assertNotIn("search_partitions", str(cm.exception))
+
+    def test_missing_search_partitions_raises(self):
+        actor = self._ready_actor(
+            ds_attrs={"compute_partition_ids": lambda *a, **kw: []}
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            actor.measure_sharded(queries=[], k_list=[10])
+        self.assertIn("search_partitions", str(cm.exception))
+        self.assertNotIn("compute_partition_ids", str(cm.exception))
+
+    def test_missing_both_apis_lists_both(self):
+        actor = self._ready_actor(ds_attrs={})
+        with self.assertRaises(RuntimeError) as cm:
+            actor.measure_sharded(queries=[], k_list=[10])
+        msg = str(cm.exception)
+        self.assertIn("compute_partition_ids", msg)
+        self.assertIn("search_partitions", msg)
+
+    def test_prewarm_required_before_measure(self):
+        # Both APIs present but no sharded prewarm yet → still fails,
+        # with a different message (orthogonal precondition).
+        actor, _ = _make_actor_for_validation(l2_dir=None)
+        actor._sharded_index_name = None
+        actor._ds = _StubDataset(
+            compute_partition_ids=lambda *a, **kw: [],
+            search_partitions=lambda *a, **kw: None,
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            actor.measure_sharded(queries=[], k_list=[10])
+        self.assertIn("prewarm_partitions", str(cm.exception))
+
+
+class AssertL2ValidationCleanTest(unittest.TestCase):
+    """The driver helper hard-fails the run whenever the actor's
+    ``l2_validation`` block reports drift after the strict v6 prewarm
+    path returned. Non-distributed sessions (empty validation block)
+    must be ignored.
+    """
+
+    @staticmethod
+    def _load_helper():
+        if "ray" not in sys.modules:
+            _stub = types.ModuleType("ray")
+
+            def _remote(*a, **kw):
+                if len(a) == 1 and callable(a[0]):
+                    return a[0]
+                return lambda c: c
+
+            _stub.remote = _remote
+            _stub._private = types.SimpleNamespace(
+                worker=types.SimpleNamespace(_global_node=None)
+            )
+            sys.modules["ray"] = _stub
+        import run_distributed_bench  # noqa: PLC0415
+
+        return run_distributed_bench._assert_l2_validation_clean
+
+    def test_passes_when_every_actor_reports_clean(self):
+        assert_clean = self._load_helper()
+        # Should not raise.
+        assert_clean(
+            [
+                {
+                    "actor_id": 0,
+                    "l2_validation": {
+                        "l2_file_count": 3,
+                        "expected_count": 3,
+                        "missing_count": 0,
+                        "extra_count": 0,
+                        "missing": [],
+                        "extra": [],
+                        "l2_prefix_dirs": ["ds-vector_idx"],
+                    },
+                },
+                {
+                    "actor_id": 1,
+                    "l2_validation": {
+                        "l2_file_count": 3,
+                        "expected_count": 3,
+                        "missing_count": 0,
+                        "extra_count": 0,
+                        "missing": [],
+                        "extra": [],
+                        "l2_prefix_dirs": ["ds-vector_idx"],
+                    },
+                },
+            ]
+        )
+
+    def test_passes_for_non_distributed_empty_block(self):
+        # Moka / no-cache sessions return an empty ``l2_validation`` —
+        # the assert must not treat absence-of-block as a failure.
+        assert_clean = self._load_helper()
+        assert_clean(
+            [
+                {"actor_id": 0, "l2_validation": {}},
+                {"actor_id": 1},  # block entirely absent
+            ]
+        )
+
+    def test_raises_on_missing_partition_files(self):
+        assert_clean = self._load_helper()
+        with self.assertRaises(RuntimeError) as cm:
+            assert_clean(
+                [
+                    {
+                        "actor_id": 3,
+                        "l2_validation": {
+                            "l2_file_count": 2,
+                            "expected_count": 3,
+                            "missing_count": 1,
+                            "extra_count": 0,
+                            "missing": [7],
+                            "extra": [],
+                            "l2_prefix_dirs": ["ds-vector_idx"],
+                        },
+                    }
+                ]
+            )
+        msg = str(cm.exception)
+        self.assertIn("actor=3", msg)
+        self.assertIn("missing=1", msg)
+        self.assertIn("[7]", msg)
+
+    def test_raises_on_extra_partition_files(self):
+        # ``extra_count > 0`` flags a stale-prefix collision — equally
+        # fatal because the residency probe later refuses to claim a
+        # residency under that ambiguity.
+        assert_clean = self._load_helper()
+        with self.assertRaises(RuntimeError) as cm:
+            assert_clean(
+                [
+                    {
+                        "actor_id": 0,
+                        "l2_validation": {
+                            "l2_file_count": 4,
+                            "expected_count": 3,
+                            "missing_count": 0,
+                            "extra_count": 1,
+                            "missing": [],
+                            "extra": [99],
+                            "l2_prefix_dirs": ["ds-vector_idx", "ds-stale"],
+                        },
+                    }
+                ]
+            )
+        msg = str(cm.exception)
+        self.assertIn("extra=1", msg)
+        self.assertIn("[99]", msg)
+        self.assertIn("ds-stale", msg)
+
+
+class DistributedDriverSharedModeNotBlockedTest(unittest.TestCase):
+    """``--mode sharded`` / ``--prewarm sharded`` must reach the actor
+    methods rather than hard-failing at driver startup. The actor itself
+    guards the v6 sharded APIs via ``hasattr``; the driver-level guard
+    was lifted so the verified-API contract from issue #7 is honoured.
+    """
+
+    @staticmethod
+    def _load_main():
+        if "ray" not in sys.modules:
+            _stub = types.ModuleType("ray")
+
+            def _remote(*a, **kw):
+                if len(a) == 1 and callable(a[0]):
+                    return a[0]
+                return lambda c: c
+
+            _stub.remote = _remote
+            _stub._private = types.SimpleNamespace(
+                worker=types.SimpleNamespace(_global_node=None)
+            )
+            sys.modules["ray"] = _stub
+        import run_distributed_bench  # noqa: PLC0415
+
+        return run_distributed_bench
+
+    def test_driver_module_no_longer_carries_v6_sharded_block(self):
+        # The previous review fix hard-coded a ``return 2`` for
+        # ``--mode sharded`` / ``--prewarm sharded``. Issue #7 directs
+        # the driver to depend on the actor-level API guards instead, so
+        # the v6 block-text string must be gone.
+        mod = self._load_main()
+        src = Path(mod.__file__).read_text()
+        self.assertNotIn(
+            "is not yet ported to Lance 6.0",
+            src,
+            msg="driver still carries the old sharded-mode hard-fail",
+        )
 
 
 if __name__ == "__main__":

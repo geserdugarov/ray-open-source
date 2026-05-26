@@ -5,15 +5,24 @@
 Design only. Targets the Lance branch `private-cache-6.0-ver-1` in
 `../lance-open-source` (commits `b3d546a64..9ebfe4de0`).
 
-**Sharded-mode port BLOCKED.** Python API verification against the pinned
-commit `9ebfe4de0` confirms that `Dataset.compute_partition_ids` and
-`Dataset.search_partitions` are Rust-only and have no PyO3 wrappers.
-The other three required APIs (`Session.with_distributed_cache`,
-`Session.size_bytes`, `Dataset.prewarm_index`) are present. See
-[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) for the
-full table, unblock paths, and re-verification command. Do not start the
-`--mode sharded` rewrite until the Lance side ships the missing wrappers
-or a human explicitly accepts the replicated-only fallback.
+**Sharded-mode port: actor-side gated.** The original verification
+against commit `9ebfe4de0` found `Dataset.compute_partition_ids` and
+`Dataset.search_partitions` Rust-only (see
+[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) for
+the original table). The Ray-side rewrite (issue #7) has now landed:
+the sharded actor methods (`HybridSearchActor.measure_sharded`,
+`HybridSearchActor.search_partitions`, `CoordinatorActor.__init__`)
+depend on those Python APIs and gate each via ``hasattr``, raising a
+clear `RuntimeError` on first use against a pylance build that is
+missing either wrapper. The driver-level pre-block was lifted so a
+build that ships both runs end-to-end. Sharded prewarm uses the v6
+strict `Dataset.prewarm_index(name, partition_ids=...)` path and the
+driver hard-fails before measurement on any L2 file-count drift
+(missing or extra partitions vs. the expected per-actor slice). Re-run
+[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) to
+confirm the wrappers are present in the pylance build you intend to
+benchmark against; without them the sharded codepaths still raise on
+first call.
 
 This document is the successor of
 [`lance-hybrid-cache-ivf-rq.md`](./lance-hybrid-cache-ivf-rq.md). That plan
@@ -886,12 +895,16 @@ the cost estimate slips if any answer comes back unexpected):
 
 Summary of what blocks vs. what is decided:
 
-- Item (0) is a **hard, blocking Lance-side prerequisite** -- the
-  `--mode sharded` rewrite cannot land until the Lance team ships
-  PyO3 wrappers for `compute_partition_ids` and `search_partitions`.
-  Implementation of this plan should not start until item (0) is
-  resolved (either the Lance patch lands, or the team accepts the
-  reduced-scope `--mode replicated`-only fallback).
+- Item (0) is a **Lance-side runtime requirement** -- the Ray-side
+  `--mode sharded` rewrite has landed with actor-side ``hasattr``
+  gates around `compute_partition_ids` / `search_partitions`. A
+  pylance build that ships both wrappers runs the sharded path
+  end-to-end; a build that does not raises a clear `RuntimeError`
+  on first use. The driver-level pre-block was lifted (see Status
+  above). The Lance patch is still required for any actual sharded
+  benchmarking; verifying it against the pylance build under test is
+  recorded in
+  [`lance-v6-api-verification.md`](./lance-v6-api-verification.md).
 - Item (1) is an **optional Lance-side improvement** -- the rewrite
   is buildable without it (the plan defaults to L2-directory-only
   observability); if the PyO3 wrapper for `DistributedCacheStats`
