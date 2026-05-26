@@ -604,6 +604,36 @@ surfaces unexpected L2 growth and any new tombstones
 (`tombstones_added=True` is a hard error from a failed invalidation
 rename).
 
+### Freshness drill (`--simulate-invalidation`)
+
+Pair `--scenario distributed --prewarm sharded` with
+`--simulate-invalidation` to exercise the v6 freshness contract
+end-to-end after the first measure phase. The drill:
+
+1. Calls `Session.invalidate_index_cache(uri, index_addr)` on every
+   worker (and the `CoordinatorActor` under `--mode sharded`) with one
+   retry on `IOError` — anything beyond that re-raises and aborts the
+   run.
+2. Walks each actor-local L2 directory via `snapshot_l2_dir` and
+   verifies the per-prefix `v1/{sanitize(prefix)}/` subdir is gone or
+   has been atomically renamed to `.{sanitize(prefix)}.deleting-{nonce}/`.
+   A surviving non-deleting subdir is a freshness-contract violation
+   and the drill hard-fails.
+3. Reruns the v6 strict sharded prewarm to measure the cold L2
+   rehydration cost.
+4. Reruns the measure phase. Per-k latency deltas (`(measure2 -
+   measure1) / measure1 * 100`) are written to
+   `<out-dir>/invalidation.json` alongside per-actor invalidate
+   times, the rehydrate-prewarm wall-time, and full first/second
+   percentile summaries; both are expected to fall within noise
+   (~5%) once L2 is rehydrated.
+
+Recommended on any first run against a new pylance build because it
+catches regressions in the Rust generation / tombstone protocol that
+unit tests alone do not. Skip it (default) when an existing build is
+already known good and the run is purely measuring steady-state
+latency.
+
 The same probe is exposed as a standalone script that can attach to a
 live Ray cluster while the bench's actors are still alive — useful for
 ad-hoc snapshots between phases or after manual experiments:

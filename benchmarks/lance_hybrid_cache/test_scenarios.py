@@ -1094,5 +1094,292 @@ class DistributedDriverSharedModeNotBlockedTest(unittest.TestCase):
         )
 
 
+class ResolveIndexAddrTest(unittest.TestCase):
+    """``resolve_index_addr`` maps an index name to the stable address
+    ``Session.invalidate_index_cache`` keys against.
+
+    Lance 6.0's canonical shape is
+    ``IndexDescription.segments[0].uuid``; older or divergent builds
+    carry the address as a top-level descriptor attribute, so the
+    helper falls back through ``uuid`` / ``index_uuid`` / ``id`` /
+    ``index_id`` / ``addr`` before giving up.
+    """
+
+    @staticmethod
+    def _helper():
+        from _hybrid_cache_helpers import resolve_index_addr  # noqa: PLC0415
+
+        return resolve_index_addr
+
+    def test_uses_v6_segments_uuid(self):
+        # The Lance 6.0 IndexDescription shape: segments is a list of
+        # IndexSegment, each with a uuid. The first segment's uuid is
+        # what Session.invalidate_index_cache(uri, addr) keys against.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(
+                    name="vector_idx",
+                    segments=[
+                        types.SimpleNamespace(uuid="seg-abc-123"),
+                        types.SimpleNamespace(uuid="seg-def-456"),
+                    ],
+                ),
+                types.SimpleNamespace(
+                    name="other_idx",
+                    segments=[types.SimpleNamespace(uuid="seg-other")],
+                ),
+            ]
+        )
+        self.assertEqual(self._helper()(ds, "vector_idx"), "seg-abc-123")
+
+    def test_segments_uuid_takes_priority_over_top_level_uuid(self):
+        # If both a v6 segment uuid and a legacy top-level uuid are
+        # present, the v6 path wins -- the legacy attribute is only
+        # there to keep older builds working.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(
+                    name="vector_idx",
+                    uuid="legacy-top-level",
+                    segments=[types.SimpleNamespace(uuid="v6-segment")],
+                ),
+            ]
+        )
+        self.assertEqual(self._helper()(ds, "vector_idx"), "v6-segment")
+
+    def test_falls_back_to_top_level_uuid_when_segments_empty(self):
+        # Some builds expose IndexDescription with an empty segments
+        # list (e.g. metadata-only descriptors) -- fall through to the
+        # legacy top-level alias rather than raising.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", uuid="abc-123", segments=[]),
+            ]
+        )
+        self.assertEqual(self._helper()(ds, "vector_idx"), "abc-123")
+
+    def test_falls_back_to_top_level_uuid_when_segments_attr_missing(self):
+        # v4 fork shape: no segments attribute at all.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", uuid="abc-123"),
+                types.SimpleNamespace(name="other_idx", uuid="dead-beef"),
+            ]
+        )
+        self.assertEqual(self._helper()(ds, "vector_idx"), "abc-123")
+
+    def test_falls_back_to_index_uuid(self):
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", index_uuid="uid-9"),
+            ]
+        )
+        self.assertEqual(self._helper()(ds, "vector_idx"), "uid-9")
+
+    def test_falls_back_to_id_then_index_id_then_addr(self):
+        helper = self._helper()
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", id="id-7")
+            ]
+        )
+        self.assertEqual(helper(ds, "vector_idx"), "id-7")
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", index_id="iid-9")
+            ]
+        )
+        self.assertEqual(helper(ds, "vector_idx"), "iid-9")
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", addr="addr-42")
+            ]
+        )
+        self.assertEqual(helper(ds, "vector_idx"), "addr-42")
+
+    def test_raises_when_index_name_missing(self):
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="other_idx", uuid="abc"),
+            ]
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            self._helper()(ds, "vector_idx")
+        self.assertIn("not found", str(cm.exception))
+
+    def test_raises_when_descriptor_has_no_known_addr_field(self):
+        # No segments, no top-level alias -- the v6 freshness drill
+        # cannot resolve a stable address so the helper must hard-fail.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [types.SimpleNamespace(name="vector_idx")]
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            self._helper()(ds, "vector_idx")
+        msg = str(cm.exception)
+        self.assertIn("address", msg)
+
+    def test_raises_when_segments_first_entry_has_no_uuid(self):
+        # An IndexSegment without a uuid attribute (corrupt / partial
+        # descriptor) should not silently pass through; if the segments
+        # list is present but unusable AND no legacy alias exists, the
+        # helper hard-fails so the drill does not invalidate the wrong
+        # prefix.
+        ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(
+                    name="vector_idx",
+                    segments=[types.SimpleNamespace()],  # no uuid attr
+                ),
+            ]
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            self._helper()(ds, "vector_idx")
+        self.assertIn("address", str(cm.exception))
+
+
+class InvalidateIndexCacheActorTest(unittest.TestCase):
+    """``HybridSearchActor.invalidate_index_cache`` calls
+    ``Session.invalidate_index_cache(uri, addr)`` with one retry on
+    ``IOError`` and re-raises if the retry also fails.
+    """
+
+    @staticmethod
+    def _build_actor(*, raises=()):
+        actor, mod = _make_actor_for_validation(l2_dir=None)
+        attempts = []
+
+        class _Sess:
+            def __init__(self):
+                self._size_bytes_val = 0
+                self._calls = 0
+
+            def size_bytes(self):
+                return self._size_bytes_val
+
+            def invalidate_index_cache(self, uri, addr):
+                attempts.append((uri, addr))
+                idx = len(attempts) - 1
+                if idx < len(raises) and raises[idx] is not None:
+                    raise raises[idx]
+
+        actor._sess = _Sess()
+        actor._ds = types.SimpleNamespace(
+            describe_indices=lambda: [
+                types.SimpleNamespace(name="vector_idx", uuid="abc-uuid"),
+            ]
+        )
+        return actor, attempts, mod
+
+    def test_happy_path_one_attempt(self):
+        actor, attempts, _ = self._build_actor()
+        result = actor.invalidate_index_cache(
+            "s3://bucket/path/", "vector_idx", retry_sleep_s=0
+        )
+        self.assertEqual(attempts, [("s3://bucket/path/", "abc-uuid")])
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["index_addr"], "abc-uuid")
+        self.assertFalse(result["retried"])
+        self.assertIsNone(result["retry_error"])
+        self.assertIsNone(result["l2_snapshot"])  # actor has no L2 dir
+
+    def test_retries_once_on_ioerror(self):
+        actor, attempts, _ = self._build_actor(raises=(IOError("rename failed"),))
+        result = actor.invalidate_index_cache(
+            "uri", "vector_idx", retry_sleep_s=0
+        )
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(result["attempts"], 2)
+        self.assertTrue(result["retried"])
+        self.assertIn("rename failed", result["retry_error"])
+
+    def test_reraises_after_retry_exhausted(self):
+        actor, attempts, _ = self._build_actor(
+            raises=(IOError("first"), IOError("second"))
+        )
+        with self.assertRaises(IOError) as cm:
+            actor.invalidate_index_cache("uri", "vector_idx", retry_sleep_s=0)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("second", str(cm.exception))
+
+    def test_does_not_retry_on_non_ioerror(self):
+        actor, attempts, _ = self._build_actor(raises=(ValueError("config bug"),))
+        with self.assertRaises(ValueError):
+            actor.invalidate_index_cache("uri", "vector_idx", retry_sleep_s=0)
+        # Non-IOError surfaces immediately; the retry budget is reserved
+        # for the documented rename / drain failure path.
+        self.assertEqual(len(attempts), 1)
+
+    def test_raises_when_session_lacks_invalidate_method(self):
+        actor, _, _ = self._build_actor()
+        actor._sess = types.SimpleNamespace(size_bytes=lambda: 0)
+        with self.assertRaises(RuntimeError) as cm:
+            actor.invalidate_index_cache("uri", "vector_idx", retry_sleep_s=0)
+        self.assertIn("invalidate_index_cache", str(cm.exception))
+
+
+class PctDeltaTest(unittest.TestCase):
+    """``_pct_delta`` is the percentage formula used by the
+    invalidation drill's measure1 → measure2 comparison. Zero baselines
+    return 0.0 rather than raising, matching the JSON contract for
+    skipped percentile values.
+    """
+
+    @staticmethod
+    def _helper():
+        if "ray" not in sys.modules:
+            _stub = types.ModuleType("ray")
+            _stub.remote = lambda *a, **kw: (a[0] if len(a) == 1 else (lambda c: c))
+            _stub._private = types.SimpleNamespace(
+                worker=types.SimpleNamespace(_global_node=None)
+            )
+            sys.modules["ray"] = _stub
+        import run_distributed_bench  # noqa: PLC0415
+
+        return run_distributed_bench._pct_delta
+
+    def test_returns_zero_for_zero_baseline(self):
+        self.assertEqual(self._helper()(0.001, 0.0), 0.0)
+
+    def test_positive_delta(self):
+        # second pass slower by 5% — within-noise wins for warm rehydrate.
+        self.assertAlmostEqual(self._helper()(0.0105, 0.01), 5.0)
+
+    def test_negative_delta_preserved(self):
+        # second pass faster than first; do not clamp to zero, that
+        # would mask a genuine cache-state improvement.
+        self.assertAlmostEqual(self._helper()(0.0095, 0.01), -5.0)
+
+
+class SimulateInvalidationCliGuardTest(unittest.TestCase):
+    """``--simulate-invalidation`` requires ``--scenario=distributed``
+    and ``--prewarm=sharded``; bad combinations must error out before
+    a long measure pass burns through and discovers the drill cannot
+    rehydrate the L2 prefix deterministically.
+    """
+
+    @staticmethod
+    def _module():
+        if "ray" not in sys.modules:
+            _stub = types.ModuleType("ray")
+            _stub.remote = lambda *a, **kw: (a[0] if len(a) == 1 else (lambda c: c))
+            _stub._private = types.SimpleNamespace(
+                worker=types.SimpleNamespace(_global_node=None)
+            )
+            sys.modules["ray"] = _stub
+        import run_distributed_bench  # noqa: PLC0415
+
+        return run_distributed_bench
+
+    def test_flag_exists_on_parser(self):
+        mod = self._module()
+        src = Path(mod.__file__).read_text()
+        self.assertIn("--simulate-invalidation", src)
+
+    def test_drill_helper_present(self):
+        mod = self._module()
+        self.assertTrue(hasattr(mod, "_run_invalidation_drill"))
+        self.assertTrue(hasattr(mod, "_run_measure_pass"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -315,6 +315,7 @@ Key knobs unique to the distributed driver:
 | `--codecless-mb N` | Deprecated v4 hybrid knob. The v6 distributed cache has no codec-less Moka tier; passing this flag prints a warning and is otherwise ignored. |
 | `--prewarm-ram-fraction F` | Legacy no-op. Previously scaled the hybrid foyer L1 budget used by `policy='hybrid_tiered'` when hybrid prewarm filled L1 first and the rest spilled to L2. The current `hybrid_tiered` policy places every owned partition in L2 and never admits to L1 during prewarm, so there is no L1 budget to scale; values other than `1.0` are flagged as ignored. |
 | `--pre-measure-residency-probe` | Also run the v6 aggregate-only residency probe between prewarm and measure. Off by default for symmetry with the v4 narrative — the probe itself is side-effect-free under v6 (one filesystem walk under `{l2_dir}/v1/{prefix}/` plus `Session.size_bytes()` per actor, returned in a single RPC), but a single flag controls both the pre-measure and the post-measure probes so they are written symmetrically to `partition_residency.jsonl`. The v4 no-load per-partition L1 probe has no v6 equivalent — the L2 directory walk plus aggregate `Session.size_bytes()` is the replacement. The post-measure probe always runs for forced/sharded prewarm with `--scenario` other than `no-cache` because it cannot pollute the measurement. |
+| `--simulate-invalidation` | Opt-in v6 freshness drill that fires after the first measure phase. Calls `Session.invalidate_index_cache(uri, index_addr)` on every actor (and on the `CoordinatorActor` under `--mode sharded`) with one retry on `IOError`; verifies the per-prefix L2 subdir is gone or in a `.{sanitize(prefix)}.deleting-{nonce}/` sentinel state via `snapshot_l2_dir`; reruns sharded prewarm to time the cold L2 rehydration; reruns the measure phase. Writes `<out-dir>/invalidation.json` with first/second per-k latency summaries, per-actor invalidate times, the rehydrate-prewarm wall-time, and per-k percentage deltas. Requires `--scenario distributed` and `--prewarm sharded` (only the v6 strict sharded prewarm rehydrates the L2 prefix deterministically). |
 | `--actor-resource NAME` | Optional Ray custom resource required by each `HybridSearchActor`; use this in a real cluster to pin workers to actor nodes. Each actor reserves 1.0 of the resource. |
 | `--coordinator-resource NAME` | Optional Ray custom resource required by the `CoordinatorActor` in `--mode sharded`; use this in a real cluster to pin the coordinator to the head/coordinator node. |
 
@@ -345,6 +346,20 @@ previous bench shares the L2 path) the residency claim is refused
 rather than per-partition identity — Lance 6.0 has no no-load L1 probe
 (the v4 `in_l1` / `not_in_l1` lists are dropped). See
 [`check_l2_residency.py`](check_l2_residency.py) for the walk + schema.
+
+Pass `--simulate-invalidation` (only valid with `--scenario distributed`
+and `--prewarm sharded`) to also exercise the v6 freshness contract:
+after the first measure phase the driver invalidates every actor's
+cache via `Session.invalidate_index_cache(uri, index_addr)` (one retry
+on `IOError`, hard-fail beyond that), verifies the per-prefix L2 subdir
+went away or is in a `.{sanitize(prefix)}.deleting-{nonce}/` sentinel
+state, reruns sharded prewarm to time cold L2 rehydration, and reruns
+measure. A second JSON file `<out-dir>/invalidation.json` carries the
+first/second per-k latency summaries, per-actor invalidate times, the
+rehydrate-prewarm wall-time, and per-k percentage deltas (also exposed
+as plan-style top-level `measure1_p50_s` / `measure1_p95_s` /
+`measure2_p50_s` / `measure2_p95_s` / `delta_*_pct` fields, computed
+against the first k in `--k-list`).
 
 Caveats:
 

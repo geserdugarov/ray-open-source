@@ -257,6 +257,72 @@ def size_bytes_stats(sess) -> Dict[str, int]:
     return {"size_bytes": int(sess.size_bytes())}
 
 
+def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
+    """Return the Lance-side index address for ``Session.invalidate_index_cache``.
+
+    v6 ``Session.invalidate_index_cache(dataset_uri, index_addr)`` keys
+    the per-prefix L2 subdirectory by the index's stable address rather
+    than its human-readable name; the driver only knows the name
+    (``--index-name``) so the actor resolves it via
+    ``dataset.describe_indices()``.
+
+    Lance 6.0 spells the address as
+    ``IndexDescription.segments[0].uuid`` -- the same UUID the
+    distributed cache uses to sanitize the on-disk prefix subdir under
+    ``{l2_dir}/v1/{sanitize(prefix)}/``. The resolver reads that first.
+    A handful of older / divergent builds (and the v4 fork the bench
+    was originally written against) carry the address on the descriptor
+    itself as ``uuid`` / ``index_uuid`` / ``id`` / ``index_id`` /
+    ``addr``; those are tried as fallbacks so the bench can run against
+    a few buildable revisions, but the canonical v6 path is the
+    segment UUID. Raises ``RuntimeError`` if the named index is absent
+    or carries no recognisable address -- the invalidation drill is
+    not safe to run when the address cannot be resolved
+    deterministically.
+    """
+    try:
+        descs = ds.describe_indices()
+    except Exception as e:
+        raise RuntimeError(
+            f"resolve_index_addr: ds.describe_indices() failed: {e!r}"
+        ) from e
+    candidates = []
+    for d in descs:
+        d_name = getattr(d, "name", None)
+        if d_name != index_name:
+            continue
+        # v6 canonical: IndexDescription.segments[0].uuid. Most indices
+        # under Lance 6.0 are single-segment; multi-segment indices
+        # share a stable head segment whose UUID keys the cache prefix.
+        segments = getattr(d, "segments", None) or []
+        if segments:
+            seg_uuid = getattr(segments[0], "uuid", None)
+            if seg_uuid:
+                return str(seg_uuid)
+        # Fallback path: older builds (and the v4 fork) carry the
+        # address on the descriptor itself.
+        for attr in ("uuid", "index_uuid", "id", "index_id", "addr"):
+            value = getattr(d, attr, None)
+            if value:
+                return str(value)
+        candidates.append(d)
+    if candidates:
+        attrs = sorted(
+            a for a in dir(candidates[0]) if not a.startswith("_")
+        )
+        raise RuntimeError(
+            f"resolve_index_addr: index {index_name!r} present but no "
+            f"address found on descriptor (attrs={attrs}); needs a "
+            "Lance 6.0 build that exposes segments[0].uuid on "
+            "describe_indices() entries (or one of the legacy "
+            "uuid / index_uuid / id aliases)"
+        )
+    raise RuntimeError(
+        f"resolve_index_addr: index {index_name!r} not found on dataset; "
+        "is --index-name correct and was the index built?"
+    )
+
+
 def build_session(spec: Dict[str, Any]):
     """Construct a lance.Session for a Lance 6.0 scenario spec.
 

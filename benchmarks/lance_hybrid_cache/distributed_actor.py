@@ -518,6 +518,89 @@ class HybridSearchActor:
         row_ids = np.asarray(rb.column("_rowid"), dtype=np.uint64)
         return distances, row_ids
 
+    def invalidate_index_cache(
+        self,
+        dataset_uri: str,
+        index_name: str,
+        retry_sleep_s: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Drop this actor's cached index state and L2 prefix subdir.
+
+        Resolves the index's stable address (``index_addr``) from the
+        index name on the actor side (the driver only knows the name)
+        and calls ``Session.invalidate_index_cache(dataset_uri,
+        index_addr)``. v6's contract is:
+
+        * The call is synchronous and returns ``None`` on success.
+        * On rename / drain failure the backend raises ``IOError``
+          (``Err(PyIOError)``) AND writes a tombstone -- a single
+          retry from the same session is the documented recovery
+          path. Anything beyond one retry indicates the v6 freshness
+          contract is broken and the driver should hard-fail (the
+          retry budget is intentionally tight; queries against a
+          stale-but-unrevoked prefix would silently return wrong
+          results).
+        * Post-call the L2 layout either drops the per-prefix subdir
+          immediately or renames it to ``.{sanitize(prefix)}.deleting-
+          {nonce}/`` for background removal. Both states satisfy the
+          freshness contract; the L2 snapshot returned below lets the
+          driver verify whichever happened on this filesystem.
+
+        Returns a dict carrying the resolved ``index_addr``, attempt
+        count (1 on success, 2 on retry), total invalidate wall-time,
+        and the post-invalidate L2 snapshot (with ``files`` stripped
+        for the over-the-wire payload).
+        """
+        if not hasattr(self._sess, "invalidate_index_cache"):
+            raise RuntimeError(
+                "this pylance build does not expose "
+                "Session.invalidate_index_cache; needs the Lance 6.0 "
+                "distributed-cache freshness primitive"
+            )
+        from _hybrid_cache_helpers import resolve_index_addr
+
+        index_addr = resolve_index_addr(self._ds, index_name)
+        t0 = time.time()
+        attempts = 0
+        # One retry on IOError per the v6 contract; anything beyond
+        # that re-raises so the driver hard-fails. We do not catch
+        # broader exceptions -- LanceError / ValueError are config /
+        # state bugs, not the freshness path.
+        first_io_error: IOError | None = None
+        for attempt in (0, 1):
+            attempts += 1
+            try:
+                self._sess.invalidate_index_cache(dataset_uri, index_addr)
+                break
+            except IOError as e:
+                if attempt == 0:
+                    first_io_error = e
+                    time.sleep(retry_sleep_s)
+                    continue
+                raise
+        duration_s = time.time() - t0
+
+        l2_snapshot: Dict[str, Any] | None = None
+        if self._l2_dir is not None:
+            from l2_inspect import snapshot_l2_dir as _snapshot
+
+            l2_snapshot = _snapshot(self._l2_dir)
+            l2_snapshot.pop("files", None)
+            l2_snapshot["actor_id"] = self._actor_id
+
+        return {
+            "actor_id": self._actor_id,
+            "index_addr": index_addr,
+            "duration_s": duration_s,
+            "attempts": attempts,
+            "l2_snapshot": l2_snapshot,
+            "stats_post_invalidate": self._size_bytes_stats(self._sess),
+            "retried": attempts > 1,
+            "retry_error": (
+                repr(first_io_error) if first_io_error is not None else None
+            ),
+        }
+
     def cache_stats(self) -> Dict[str, Any]:
         """Return current cache stats and the worker's coord-driven counter.
 
@@ -630,6 +713,56 @@ class CoordinatorActor:
         t0 = time.time()
         self._ds.compute_partition_ids(self._index_name, qa, self._nprobes)
         return {"duration_s": time.time() - t0}
+
+    def invalidate_index_cache(
+        self,
+        dataset_uri: str,
+        index_name: str,
+        retry_sleep_s: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Drop the coordinator's cached IVF routing state.
+
+        Mirror of :meth:`HybridSearchActor.invalidate_index_cache`. The
+        coordinator holds ``IvfIndexState`` in its metadata L1 (set up
+        in ``warmup_routing``); without invalidating it the coord
+        keeps routing against a stale model after the workers have
+        been freshened. Same one-retry-on-IOError contract as the
+        worker. The coord has no L2 tier, so no L2 snapshot is
+        returned.
+        """
+        if not hasattr(self._sess, "invalidate_index_cache"):
+            raise RuntimeError(
+                "this pylance build does not expose "
+                "Session.invalidate_index_cache; needs the Lance 6.0 "
+                "distributed-cache freshness primitive"
+            )
+        from _hybrid_cache_helpers import resolve_index_addr
+
+        index_addr = resolve_index_addr(self._ds, index_name)
+        t0 = time.time()
+        attempts = 0
+        first_io_error: IOError | None = None
+        for attempt in (0, 1):
+            attempts += 1
+            try:
+                self._sess.invalidate_index_cache(dataset_uri, index_addr)
+                break
+            except IOError as e:
+                if attempt == 0:
+                    first_io_error = e
+                    time.sleep(retry_sleep_s)
+                    continue
+                raise
+        return {
+            "actor_id": "coordinator",
+            "index_addr": index_addr,
+            "duration_s": time.time() - t0,
+            "attempts": attempts,
+            "retried": attempts > 1,
+            "retry_error": (
+                repr(first_io_error) if first_io_error is not None else None
+            ),
+        }
 
     def search_batch(
         self,
