@@ -3,18 +3,24 @@
 ## Status
 
 **Superseded by
-[`lance-distributed-cache-6.0.md`](./lance-distributed-cache-6.0.md).**
-That plan covers the Lance 6.0 distributed-cache port that the
-benchmark code now implements. This document is preserved as the
-v4-era reference for the foyer-backed hybrid-cache design (covered by
-commits `36474d837c` and `3be01135c3`); its API references
+[`lance-distributed-cache-6.0.md`](./lance-distributed-cache-6.0.md)
+and implementation moved out of this repository.** The Ray-owned
+`benchmarks/lance_hybrid_cache/` subtree described below has been
+deleted; the live distributed IVF cache actor / coordinator /
+example now lives in the `lance-ray` project under
+`lance_ray/distributed_cache/` and
+`examples/distributed_ivf_cache.py` (commits `17140fe..d0d09ab`).
+This document is preserved as the v4-era reference for the
+foyer-backed hybrid-cache design (covered by commits `36474d837c`
+and `3be01135c3`); its API references
 (`Session.with_hybrid_cache`, `Session.with_hybrid_cache_advanced`,
 `dataset.prewarm_vector_cache`, `index_cache_stats`, the
 `policy='hybrid_tiered'` / `'moka_ram_cap'` knobs, and the
-per-partition L1 no-load probe) do not match the current code or the
-v6 Lance Python surface — read the v6 plan for the live design.
+per-partition L1 no-load probe) do not match the v6 Lance Python
+surface — read the v6 plan and the `lance-ray` repository for the
+live design.
 
-Implemented under `benchmarks/lance_hybrid_cache/`.
+Originally implemented under `benchmarks/lance_hybrid_cache/` (now removed).
 
 This document replaces the older generic benchmark plan. The implemented
 benchmark does not use a Rust query subprocess or a separate Rust workspace in
