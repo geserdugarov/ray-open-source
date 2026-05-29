@@ -1,5 +1,16 @@
 # Lance 6.0 Python API verification (sharded-benchmark prerequisites)
 
+> **Note:** The Ray-owned `benchmarks/lance_hybrid_cache/` subtree
+> referenced throughout this document has been removed from this
+> repository. The distributed IVF cache actor / coordinator /
+> example now lives in the `lance-ray` project under
+> `lance_ray/distributed_cache/` and
+> `examples/distributed_ivf_cache.py` (commits `17140fe..d0d09ab`).
+> The verification commands below remain useful when bumping the
+> pylance pin in that project; the actor-side `hasattr` gating
+> described under *Decision* now lives in `lance-ray`, not in this
+> tree.
+
 This note records the verification of the Python (`pylance`) API surface
 required by the v6 sharded-mode benchmark port described in
 [`lance-distributed-cache-6.0.md`](./lance-distributed-cache-6.0.md).

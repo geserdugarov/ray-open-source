@@ -2,27 +2,15 @@
 
 ## Status
 
-Design only. Targets the Lance branch `private-cache-6.0-ver-1` in
-`../lance-open-source` (commits `b3d546a64..9ebfe4de0`).
-
-**Sharded-mode port: actor-side gated.** The original verification
-against commit `9ebfe4de0` found `Dataset.compute_partition_ids` and
-`Dataset.search_partitions` Rust-only (see
-[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) for
-the original table). The Ray-side rewrite (issue #7) has now landed:
-the sharded actor methods (`HybridSearchActor.measure_sharded`,
-`HybridSearchActor.search_partitions`, `CoordinatorActor.__init__`)
-depend on those Python APIs and gate each via ``hasattr``, raising a
-clear `RuntimeError` on first use against a pylance build that is
-missing either wrapper. The driver-level pre-block was lifted so a
-build that ships both runs end-to-end. Sharded prewarm uses the v6
-strict `Dataset.prewarm_index(name, partition_ids=...)` path and the
-driver hard-fails before measurement on any L2 file-count drift
-(missing or extra partitions vs. the expected per-actor slice). Re-run
-[`lance-v6-api-verification.md`](./lance-v6-api-verification.md) to
-confirm the wrappers are present in the pylance build you intend to
-benchmark against; without them the sharded codepaths still raise on
-first call.
+**Implementation moved out of this repository.** The Ray-owned
+`benchmarks/lance_hybrid_cache/` subtree this plan tracked has been
+deleted. The distributed IVF cache actor / coordinator / example now
+lives in the `lance-ray` project under
+`lance_ray/distributed_cache/` and
+`examples/distributed_ivf_cache.py` (commits `17140fe..d0d09ab`).
+Refer to that repository for the live design, runbooks, and
+implementation; the sections below are preserved as historical
+context for the v6 port and no longer describe code in this tree.
 
 This document is the successor of
 [`lance-hybrid-cache-ivf-rq.md`](./lance-hybrid-cache-ivf-rq.md). That plan
