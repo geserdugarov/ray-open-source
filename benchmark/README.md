@@ -136,14 +136,19 @@ build is not on the distributed-cache branch.
 
 The example uses 1024 rows × 16 dims × 4 partitions for a fast smoke
 test. To measure latency at a realistic scale, point the same
-primitives at a larger dataset. Save the script below as
-`./benchmark/run_distributed_bench.py` (or adapt it inline) — it
-follows the example's lifecycle but instruments per-query latency
-across a measure window:
+primitives at a larger dataset. The driver script that does this is
+checked in at [`./benchmark/run_distributed_bench.py`](./run_distributed_bench.py);
+it follows the example's lifecycle but instruments per-query latency
+across a measure window. The script source is reproduced below for
+reference (edit the file in-tree rather than re-pasting if you want to
+tweak the lifecycle):
 
 ```python
 # benchmark/run_distributed_bench.py — distributed IVF cache benchmark
-import argparse, os, time, statistics, random
+import argparse
+import os
+import statistics
+import time
 from pathlib import Path
 
 import lance
@@ -178,7 +183,8 @@ def build_dataset(uri, n_rows, dim, n_parts, n_subv, seed=7):
     return next(i for i in ds.list_indices() if i["name"] == "vec_idx")["uuid"]
 
 def percentile(values, pct):
-    if not values: return None
+    if not values:
+        return None
     ordered = sorted(values)
     rank = max(1, min(len(ordered), int(round(pct / 100.0 * len(ordered)))))
     return ordered[rank - 1]
@@ -317,6 +323,12 @@ build — it drives the canonical reload → invalidate → prewarm
 sequence end-to-end and rehydrates the cache, so it catches Lance-side
 regressions in the invalidate / prewarm contract that the smoke test
 above does not exercise.
+
+Single-node run artifacts (raw stdout, the smoke-test log, and a
+per-actor results summary) are saved under
+[`./benchmark/results/`](./results/) — see
+[`results/README.md`](./results/README.md) for the configuration that
+produced the committed numbers and the host/RAM budget used.
 
 ## 5. Optional: object-store backend
 

@@ -1,0 +1,18 @@
+INFO: Distributed IVF cache (v1, RAM-only) example
+INFO: Building synthetic IVF_PQ-indexed dataset at /tmp/lance-ray-cache-example-ktsg9lx7/vectors.lance
+INFO: Final create_index rust time: 0.023946046829223633s
+/home/d00838679/git/lance-open-source/python/python/lance/__init__.py:298: UserWarning: lance is not fork-safe. If you are using multiprocessing, use spawn or forkserver instead.
+  warnings.warn(
+2026-06-01 18:31:46,646	INFO worker.py:2012 -- Started a local Ray instance.
+/home/d00838679/venv-bench/lib/python3.12/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+INFO: Phase 1: prewarm each actor's owned slice
+INFO:   actor 0 owns 2 partitions (prewarm_obs_seconds=0.0004)
+INFO:   actor 1 owns 2 partitions (prewarm_obs_seconds=0.0004)
+INFO: Phase 2: distributed ANN search
+INFO:   top-5 ids=[199, 954, 273, 952, 1021] distances=['7.3888', '7.5444', '8.4110', '9.6370', '9.8259']
+INFO: Phase 3: invalidate + re-prewarm on index update
+INFO:   actor 0 re-prewarmed 2 partitions (prewarm_obs_seconds=0.0003, wrong_partition_probes_total=0)
+INFO:   actor 1 re-prewarmed 2 partitions (prewarm_obs_seconds=0.0003, wrong_partition_probes_total=0)
+INFO: Phase 4: search again after invalidate
+INFO:   fresh search returned 5 rows
