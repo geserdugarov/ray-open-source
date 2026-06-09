@@ -307,7 +307,7 @@ def write_results(out_dir: Path, results: list[dict]) -> None:
                     "n": pct["n"],
                     # v6: `Session.size_bytes()` is the only cumulative
                     # session-size accessor; v4 hit / miss / entry counters
-                    # are gone (see plans/benchmark/lance-distributed-cache-6.0.md
+                    # are gone (see the distributed-cache benchmark plan's
                     # "Output schema and helper changes").
                     "session_size_bytes_pre": pre,
                     "session_size_bytes_post": post,

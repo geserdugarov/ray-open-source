@@ -1,4 +1,4 @@
-"""Scenario specs for the Lance distributed-cache benchmark (Lance 6.0).
+"""Scenario specs for the Lance distributed-cache benchmark (Lance 7.0).
 
 Byte values are tuned for a 12 CPU / 32 GB host and a ~10 GB IVF_RQ index
 (10M * 1024-d, num_bits=8, 3000 partitions). With a 4 GiB DRAM cap, moka

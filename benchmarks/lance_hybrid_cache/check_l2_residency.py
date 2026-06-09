@@ -8,7 +8,7 @@ actors are still alive.
 What this checks
 ----------------
 
-Lance 6.0's distributed cache writes one ``part-ivf-{id}.bin`` per
+Lance 7.0's distributed cache writes one ``part-ivf-{id}.bin`` per
 prewarmed partition under ``{l2_dir}/v1/{sanitize(prefix)}/``. File
 presence one-to-one maps to L2 residency, so a directory walk is an
 *exact* probe -- the v4 ``partition_is_in_l2`` ambiguity goes away. The

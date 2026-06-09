@@ -154,7 +154,7 @@ def parse_k_list(spec: str) -> List[int]:
 def print_l2_summary(results: List[dict]) -> None:
     """Per-scenario L2 footprint and session-size snapshots.
 
-    Lance 6.0 exposes only `Session.size_bytes()`, so per-phase hit/miss
+    Lance 7.0 exposes only `Session.size_bytes()`, so per-phase hit/miss
     decomposition (the v4 "Warmup-phase counters" block) has no v6 analog.
     The session-size delta (post - pre) is reported as the cumulative
     growth signal; treat it as informative, not a hit-ratio replacement.
@@ -173,7 +173,7 @@ def print_l2_summary(results: List[dict]) -> None:
                     f"disk={format_bytes(pre['disk_bytes'])})"
                 )
 
-    print("\n=== Session size (Lance 6.0 size_bytes) ===")
+    print("\n=== Session size (Lance 7.0 size_bytes) ===")
     for r in results:
         pre = int(r.get("stats_pre", {}).get("size_bytes", 0))
         post = int(r.get("stats_post", {}).get("size_bytes", 0))

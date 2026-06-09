@@ -246,13 +246,12 @@ class ScenarioResult:
 def size_bytes_stats(sess) -> Dict[str, int]:
     """v6 stats dict for a Lance Session.
 
-    Lance 6.0 removed `Session.index_cache_stats()`; the sole surviving
+    Lance 7.0 removed `Session.index_cache_stats()`; the sole surviving
     accessor is `Session.size_bytes()`. The returned dict carries only
     that one key — fabricating `hits`/`misses`/`num_entries` would let
     downstream code report misleading 0% hit ratios for measurements
-    that are simply unavailable in v6. See
-    plans/benchmark/lance-distributed-cache-6.0.md ("Output schema and
-    helper changes") for the rationale.
+    that are simply unavailable in v6. See the distributed-cache benchmark
+    plan's "Output schema and helper changes" section for the rationale.
     """
     return {"size_bytes": int(sess.size_bytes())}
 
@@ -266,7 +265,7 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
     (``--index-name``) so the actor resolves it via
     ``dataset.describe_indices()``.
 
-    Lance 6.0 spells the address as
+    Lance 7.0 spells the address as
     ``IndexDescription.segments[0].uuid`` -- the same UUID the
     distributed cache uses to sanitize the on-disk prefix subdir under
     ``{l2_dir}/v1/{sanitize(prefix)}/``. The resolver reads that first.
@@ -292,7 +291,7 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
         if d_name != index_name:
             continue
         # v6 canonical: IndexDescription.segments[0].uuid. Most indices
-        # under Lance 6.0 are single-segment; multi-segment indices
+        # under Lance 7.0 are single-segment; multi-segment indices
         # share a stable head segment whose UUID keys the cache prefix.
         segments = getattr(d, "segments", None) or []
         if segments:
@@ -313,7 +312,7 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
         raise RuntimeError(
             f"resolve_index_addr: index {index_name!r} present but no "
             f"address found on descriptor (attrs={attrs}); needs a "
-            "Lance 6.0 build that exposes segments[0].uuid on "
+            "Lance 7.0 build that exposes segments[0].uuid on "
             "describe_indices() entries (or one of the legacy "
             "uuid / index_uuid / id aliases)"
         )
@@ -324,7 +323,7 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
 
 
 def build_session(spec: Dict[str, Any]):
-    """Construct a lance.Session for a Lance 6.0 scenario spec.
+    """Construct a lance.Session for a Lance 7.0 scenario spec.
 
     Expected spec shapes (see `scenarios.build_scenario_spec`):
       {"kind": "no-cache"}
@@ -334,7 +333,7 @@ def build_session(spec: Dict[str, Any]):
        "metadata_l1_bytes": int,
        "partition_l1_bytes": Optional[int]}
 
-    The v4 `hybrid` / `hybrid_advanced` factories are gone in Lance 6.0;
+    The v4 `hybrid` / `hybrid_advanced` factories are gone in Lance 7.0;
     every distributed-cache run goes through
     `Session.with_distributed_cache`. `no-cache` and `moka` still use
     the plain `Session(...)` constructor that v6 retains.

@@ -28,7 +28,7 @@ class _FakeSession:
     """Stand-in for `lance.Session` capturing the constructor kwargs.
 
     Deliberately omits `index_cache_stats` — that v4 method was removed
-    in Lance 6.0 and any code that tries to call it should fail loudly
+    in Lance 7.0 and any code that tries to call it should fail loudly
     in the test suite rather than silently keep working.
     """
 
@@ -236,7 +236,7 @@ class V6SessionStatsTest(unittest.TestCase):
         # If a future test stub adds `index_cache_stats` back, every
         # production path that was supposed to be ported to size_bytes()
         # would silently keep working — defeating the v6 migration. Pin
-        # the absence so the stub matches the real Lance 6.0 _Session.
+        # the absence so the stub matches the real Lance 7.0 _Session.
         sess = _FakeSession()
         self.assertFalse(hasattr(sess, "index_cache_stats"))
         self.assertTrue(hasattr(sess, "size_bytes"))
@@ -248,7 +248,7 @@ class V6SessionStatsTest(unittest.TestCase):
         # would AttributeError here. It also must NOT fabricate zero
         # placeholders for the removed `hits` / `misses` / `num_entries`
         # keys — that would let downstream code silently report 0%
-        # hit ratios for data Lance 6.0 simply does not expose. The
+        # hit ratios for data Lance 7.0 simply does not expose. The
         # dict is intentionally minimal so KeyError surfaces stale v4
         # readers loudly.
         sess = _FakeSession()
@@ -1088,7 +1088,7 @@ class DistributedDriverSharedModeNotBlockedTest(unittest.TestCase):
         mod = self._load_main()
         src = Path(mod.__file__).read_text()
         self.assertNotIn(
-            "is not yet ported to Lance 6.0",
+            "is not yet ported to Lance 7.0",
             src,
             msg="driver still carries the old sharded-mode hard-fail",
         )
@@ -1098,7 +1098,7 @@ class ResolveIndexAddrTest(unittest.TestCase):
     """``resolve_index_addr`` maps an index name to the stable address
     ``Session.invalidate_index_cache`` keys against.
 
-    Lance 6.0's canonical shape is
+    Lance 7.0's canonical shape is
     ``IndexDescription.segments[0].uuid``; older or divergent builds
     carry the address as a top-level descriptor attribute, so the
     helper falls back through ``uuid`` / ``index_uuid`` / ``id`` /
@@ -1112,7 +1112,7 @@ class ResolveIndexAddrTest(unittest.TestCase):
         return resolve_index_addr
 
     def test_uses_v6_segments_uuid(self):
-        # The Lance 6.0 IndexDescription shape: segments is a list of
+        # The Lance 7.0 IndexDescription shape: segments is a list of
         # IndexSegment, each with a uuid. The first segment's uuid is
         # what Session.invalidate_index_cache(uri, addr) keys against.
         ds = types.SimpleNamespace(

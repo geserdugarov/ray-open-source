@@ -114,9 +114,9 @@ def plot_p99_bars(summary_csv: Path, out_png: Path) -> None:
 
 
 def plot_l1_size(summary_csv: Path, out_png: Path) -> None:
-    """Per-scenario L1 footprint chart (Lance 6.0).
+    """Per-scenario L1 footprint chart (Lance 7.0).
 
-    Replaces the v4 `plot_hit_ratio` — Lance 6.0 removed
+    Replaces the v4 `plot_hit_ratio` — Lance 7.0 removed
     `index_cache_stats()` so the bench no longer has hit/miss counters.
     The closest available signal is `Session.size_bytes()`, recorded as
     `session_size_bytes_pre` (entering the measure phase) and
@@ -170,7 +170,7 @@ def plot_l1_size(summary_csv: Path, out_png: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(agg["scenario"].tolist())
     ax.set_ylabel("Session.size_bytes() (MiB)")
-    ax.set_title("Lance 6.0 session size — pre vs. post measure phase")
+    ax.set_title("Lance 7.0 session size — pre vs. post measure phase")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
     fig.tight_layout()

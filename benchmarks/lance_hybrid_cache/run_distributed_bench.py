@@ -127,7 +127,7 @@ def _post_prewarm_l1_baseline(
 
     Aggregate-only under v6: the v4 per-partition L1 sets are gone (the
     no-load probe API ``prewarm_vector_cache(..., ram_bytes=0)`` has no
-    Lance 6.0 equivalent). The preferred baseline is the optional
+    Lance 7.0 equivalent). The preferred baseline is the optional
     post-prewarm residency probe's ``l1_size_bytes_at_probe``. For
     hybrid ``sharded`` prewarm we can still report movement without
     running that probe: ``hybrid_tiered`` admits zero vector partitions
@@ -486,7 +486,7 @@ def _format_per_actor_summary_lines(
 
     Extracted from main() so the format string can be unit-tested without
     spinning up Ray. Returns the lines as a list (including the header)
-    rather than printing them so tests can inspect the output. Lance 6.0
+    rather than printing them so tests can inspect the output. Lance 7.0
     exposes only `Session.size_bytes()`; the v4 hit/miss counters are
     gone, so per-actor rows report `bytes=` (the cumulative session
     footprint), not `hit=`.
@@ -626,8 +626,8 @@ def _run_invalidation_drill(
 ) -> Dict[str, Any]:
     """Run the optional --simulate-invalidation drill (plan Phase 2.7).
 
-    Sequence (per ``plans/benchmark/lance-distributed-cache-6.0.md``
-    *Invalidation drill*):
+    Sequence (per the distributed-cache benchmark plan's
+    *Invalidation drill* section):
 
     1. Invalidate per actor (and coord under ``--mode sharded``) via
        ``Session.invalidate_index_cache(uri, index_addr)`` with one
@@ -903,7 +903,7 @@ def main() -> int:
     # 'distributed' (matching the spec dict's `kind` from build_session).
     args.scenario = _normalize_scenario_alias(args.scenario)
 
-    # Lance 6.0 distributed-cache port: `measure_sharded` and
+    # Lance 7.0 distributed-cache port: `measure_sharded` and
     # `CoordinatorActor` depend on the Python `compute_partition_ids` /
     # `search_partitions` APIs. Per the issue body those APIs are
     # treated as verified; the driver no longer pre-blocks the path. The
@@ -1208,7 +1208,7 @@ def main() -> int:
                 skipped = int(ps.get("skipped_existing", 0))
                 owned_n = int(r["n_partitions"])
                 if args.scenario == "distributed":
-                    # Lance 6.0 strict `prewarm_index(name,
+                    # Lance 7.0 strict `prewarm_index(name,
                     # partition_ids=...)` returns no Python-visible
                     # counters; success means every requested partition
                     # was persisted to L2 atomically (or it raised
@@ -1618,7 +1618,7 @@ def main() -> int:
         f"measure wall-time: {measure_wall_s:.1f}s   "
         f"aggregate throughput: {total_queries / measure_wall_s:.1f} q/s"
     )
-    # Lance 6.0 exposes only `Session.size_bytes()`; hit / miss counters
+    # Lance 7.0 exposes only `Session.size_bytes()`; hit / miss counters
     # are gone, so the v4 aggregate hit_ratio has no v6 replacement.
     # Report cumulative L1 footprint across actors as the closest analog.
     print(

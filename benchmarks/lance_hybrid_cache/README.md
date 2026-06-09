@@ -1,6 +1,6 @@
-# Lance 6.0 distributed-cache (NVMe + DRAM) IVF_RQ benchmark
+# Lance 7.0 distributed-cache (NVMe + DRAM) IVF_RQ benchmark
 
-Measures vector-search latency for Lance 6.0's per-actor distributed
+Measures vector-search latency for Lance 7.0's per-actor distributed
 cache (metadata L1 + decoded-partition L1 + NVMe L2) against two
 baselines: *no cache* and *Moka DRAM-only*.
 
@@ -36,15 +36,19 @@ baseline.
 
 ## Pylance build
 
-The benchmark targets Lance 6.0; build pylance from a local checkout
-on the v6 distributed-cache branch rather than pulling from PyPI:
+The benchmark targets the Lance distributed-cache feature; build pylance
+from a local checkout with the required distributed-cache APIs rather
+than pulling from PyPI:
 
 - Required: `Session.with_distributed_cache`,
   `Session.invalidate_index_cache`, `Session.size_bytes`, and the
-  strict `dataset.prewarm_index(name, partition_ids=...)` path. Pin to
-  `../lance-open-source` branch `private-cache-6.0-ver-1` at commit
-  `9ebfe4de0` or newer. The PyPI `pylance` wheel is not a substitute —
-  the v6 distributed-cache surface is not on PyPI yet.
+  strict `dataset.prewarm_index(name, partition_ids=...)` path. Use a
+  `../lance-open-source` checkout that includes the cache + prewarm
+  feature and preserves the Python API from the
+  `private-cache-7.0-ver-1` line — the public-API diff must
+  be additive only — so the scenarios + drivers run unmodified. The PyPI
+  `pylance` wheel is not a substitute — the distributed-cache surface is
+  not on PyPI yet.
 - Required for `--mode sharded` / `--prewarm sharded`:
   `dataset.compute_partition_ids(name, query, nprobes)` and
   `dataset.search_partitions(name, query, partition_ids, k)`. The
@@ -60,9 +64,8 @@ on the v6 distributed-cache branch rather than pulling from PyPI:
 
 The v4 plan
 [`plans/benchmark/lance-hybrid-cache-ivf-rq.md`](../../plans/benchmark/lance-hybrid-cache-ivf-rq.md)
-is **superseded** by
-[`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md);
-read the v6 plan for the live design.
+is **superseded** by the distributed-cache benchmark plan; read that plan
+for the live design.
 
 ## One-time setup
 
@@ -73,9 +76,9 @@ source "$HOME/git/ray-open-source/python/venv/bin/activate"
 cd "$HOME/git/ray-open-source/benchmarks/lance_hybrid_cache"
 
 # 1. Lance + bench deps
-# Pin the lance-open-source checkout to the Lance 6.0 distributed-cache
-# branch (`private-cache-6.0-ver-1` at commit `9ebfe4de0` or newer) so
-# the v6 Session / Dataset APIs the driver targets are available.
+# Pin the lance-open-source checkout to a distributed-cache build with the
+# cache + prewarm APIs targeted by this benchmark. It must preserve the Python
+# API from the `private-cache-7.0-ver-1` line.
 pip install -e "$HOME/git/lance-open-source/python"
 # After this command:
 # - `import lance` resolves to lance-open-source/python/python/lance/ (live —
@@ -83,10 +86,10 @@ pip install -e "$HOME/git/lance-open-source/python"
 # - The native `_lance.so` exposes `lance.Session.with_distributed_cache(...)`,
 #   `lance.Session.invalidate_index_cache(...)`, `lance.Session.size_bytes()`,
 #   and the strict `dataset.prewarm_index(name, partition_ids=...)` path
-#   under the Lance 6.0 distributed-cache crate. The v4
+#   under the Lance 7.0 distributed-cache crate. The v4
 #   `with_hybrid_cache` / `with_hybrid_cache_advanced` factories and the
-#   `dataset.prewarm_vector_cache(...)` API are gone in v6; see
-#   `plans/benchmark/lance-distributed-cache-6.0.md`.
+#   `dataset.prewarm_vector_cache(...)` API are gone in Lance 7.0; see
+#   the distributed-cache benchmark plan.
 # - Editing Rust files under lance-open-source/python/src/ requires re-running
 #   this command (or `maturin develop`) to recompile. Python edits do not.
 #
@@ -169,12 +172,12 @@ Results land in `out/`:
 - `plots/{latency_cdf,p99_bars,l1_size}.png` — `l1_size.png` is the v6
   replacement for the v4 `hit_ratio.png` panel, charting per-scenario
   `Session.size_bytes()` pre vs. post the measure phase (the v4
-  hit-ratio signal has no v6 analog because Lance 6.0 does not expose
+  hit-ratio signal has no v6 analog because Lance 7.0 does not expose
   hit/miss counters).
 
 ## v6 DRAM split (`--metadata-l1-mb` / `--partition-l1-mb`)
 
-Under Lance 6.0 the distributed scenario's per-actor DRAM is split
+Under Lance 7.0 the distributed scenario's per-actor DRAM is split
 between two tiers, both sized by explicit CLI flags rather than the v4
 90/10 implicit split:
 
@@ -258,7 +261,7 @@ each actor to hold the whole index or just its slice:
 - In `--mode sharded`, the per-actor table reports
   `bytes=<Session.size_bytes()>` post-measure plus `owned=<count>` and
   `calls_handled=<count>` — no per-query latency on the worker side
-  (the coordinator owns the timer) and no hit-ratio column (Lance 6.0
+  (the coordinator owns the timer) and no hit-ratio column (Lance 7.0
   does not expose hit/miss counters).
 
 Run distributed and moka as two sequential invocations against the same
@@ -346,7 +349,7 @@ Key knobs unique to the distributed driver:
 The summary reports aggregate latency percentiles (across all actors)
 and per-actor rows; per-actor cache footprint is the v6
 `Session.size_bytes()` value (the v4 hit-ratio columns are gone — Lance
-6.0 does not expose hit/miss counters). `<out-dir>/distributed_results.jsonl`
+7.0 does not expose hit/miss counters). `<out-dir>/distributed_results.jsonl`
 has one record
 per actor. Whenever `--prewarm` is `forced` or `sharded` and
 `--scenario` is not `no-cache`, the driver also writes
@@ -367,7 +370,7 @@ previous bench shares the L2 path) the residency claim is refused
 (`in_l2=[]`, `missing=owned`) and the conflicting names are listed in
 `l2_prefix_dirs` so the operator notices instead of seeing a false
 "healthy" report. The L1 half is reported as a session-wide byte total
-rather than per-partition identity — Lance 6.0 has no no-load L1 probe
+rather than per-partition identity — Lance 7.0 has no no-load L1 probe
 (the v4 `in_l1` / `not_in_l1` lists are dropped). See
 [`check_l2_residency.py`](check_l2_residency.py) for the walk + schema.
 
@@ -479,7 +482,7 @@ Caveats specific to `--mode sharded`:
   remaining headroom), or negative (eviction churn). Treat the signed
   delta as informative for tuning `--partition-l1-mb`, not as a
   cache-effectiveness proxy. Use measure-phase latency vs. the
-  `no-cache` baseline for that signal — Lance 6.0 does not expose
+  `no-cache` baseline for that signal — Lance 7.0 does not expose
   hit/miss counters.
 
 ## Teardown
@@ -548,11 +551,11 @@ docker compose -f infra/docker-compose.yml down -v
 
 ## Relationship to the benchmark plan
 
-The current plan lives at
-[`../../plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md).
+The current plan lives in the benchmark plan directory as the
+distributed-cache benchmark plan.
 The v4 plan
 [`../../plans/benchmark/lance-hybrid-cache-ivf-rq.md`](../../plans/benchmark/lance-hybrid-cache-ivf-rq.md)
-is superseded by the v6 plan and is preserved as a historical
+is superseded by the distributed-cache plan and is preserved as a historical
 reference only. The original Rust-subprocess architecture from the
 pre-v4 design is also superseded. The implemented path uses the
 existing Lance Python bindings for session creation, deterministic

@@ -1,10 +1,12 @@
-# pylance is installed separately from $HOME/git/lance-open-source. Pin the
-# checkout to the Lance 6.0 distributed-cache branch (`private-cache-6.0-ver-1`
-# at commit `9ebfe4de0` or newer); the v6 `Session.with_distributed_cache`,
-# `Session.invalidate_index_cache`, `Session.size_bytes`, and the strict
+# pylance is installed separately from $HOME/git/lance-open-source. Use a local
+# checkout with the distributed-cache and prewarm feature; the
+# `Session.with_distributed_cache`, `Session.invalidate_index_cache`,
+# `Session.size_bytes`, and the strict
 # `dataset.prewarm_index(name, partition_ids=...)` path are all required by the
-# scenarios + drivers in this directory. On that branch the feature is
-# baked into the wheel and a plain editable install is sufficient:
+# scenarios + drivers in this directory. The compatible build preserves this
+# Python API exactly — the public-API diff vs the `private-cache-7.0-ver-1`
+# line is additive only — so the scenarios + drivers need no source changes. The feature
+# is baked into the local wheel and a plain editable install is sufficient:
 #   pip install -e "$HOME/git/lance-open-source/python"
 # Re-running `pip install -e` (or `maturin develop --release`) is only
 # required after Rust changes. The sharded-mode actor paths additionally

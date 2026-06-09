@@ -200,7 +200,7 @@ class HybridSearchActor:
         ``measure_sharded`` can intersect routed partitions against its
         own slice without the driver re-sending them per query.
 
-        Lance 6.0 port: calls ``dataset.prewarm_index(name,
+        Lance 7.0 port: calls ``dataset.prewarm_index(name,
         partition_ids=...)`` — the strict v6 path that writes one
         ``part-ivf-<id>.bin`` per partition under ``{l2_dir}/v1/...``
         and raises ``LanceError`` on any L2 write failure / mid-prewarm
@@ -218,7 +218,7 @@ class HybridSearchActor:
         if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
                 "this pylance build does not expose dataset.prewarm_index; "
-                "needs the Lance 6.0 distributed-cache prewarm primitive"
+                "needs the Lance 7.0 distributed-cache prewarm primitive"
             )
         t0 = time.time()
         # Dedupe to keep behavior stable; the v6 strict path tolerates
@@ -244,7 +244,7 @@ class HybridSearchActor:
         ram_bytes: int = 0,
         wait_for_disk: bool = True,
     ) -> Dict[str, Any]:
-        """Deterministic forced prewarm of an IVF partition slice (Lance 6.0).
+        """Deterministic forced prewarm of an IVF partition slice (Lance 7.0).
 
         Ports the v4 ``dataset.prewarm_vector_cache(name, ids, policy=...)``
         call site to ``dataset.prewarm_index(name, partition_ids=ids)`` —
@@ -270,7 +270,7 @@ class HybridSearchActor:
         if not hasattr(self._ds, "prewarm_index"):
             raise RuntimeError(
                 "this pylance build does not expose dataset.prewarm_index; "
-                "needs the Lance 6.0 distributed-cache prewarm primitive"
+                "needs the Lance 7.0 distributed-cache prewarm primitive"
             )
         t0 = time.time()
         unique_ids = list(dict.fromkeys(int(p) for p in partition_ids))
@@ -554,7 +554,7 @@ class HybridSearchActor:
         if not hasattr(self._sess, "invalidate_index_cache"):
             raise RuntimeError(
                 "this pylance build does not expose "
-                "Session.invalidate_index_cache; needs the Lance 6.0 "
+                "Session.invalidate_index_cache; needs the Lance 7.0 "
                 "distributed-cache freshness primitive"
             )
         from _hybrid_cache_helpers import resolve_index_addr
@@ -753,7 +753,7 @@ class CoordinatorActor:
         if not hasattr(self._sess, "invalidate_index_cache"):
             raise RuntimeError(
                 "this pylance build does not expose "
-                "Session.invalidate_index_cache; needs the Lance 6.0 "
+                "Session.invalidate_index_cache; needs the Lance 7.0 "
                 "distributed-cache freshness primitive"
             )
         from _hybrid_cache_helpers import resolve_index_addr

@@ -1,6 +1,6 @@
 """Filesystem-level observability for the Lance v6 distributed-cache L2 directory.
 
-Lance 6.0's distributed cache writes one ``part-ivf-{id}.bin`` per
+Lance 7.0's distributed cache writes one ``part-ivf-{id}.bin`` per
 prewarmed partition under a deterministic on-disk layout. Unlike v4's
 opaque foyer region files, the v6 layout one-to-one maps file presence
 to L2 residency, so a directory walk is an *exact* residency probe

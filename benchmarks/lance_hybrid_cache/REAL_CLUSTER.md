@@ -1,6 +1,6 @@
 # Real 3-node Ray cluster with separate MinIO
 
-This guide runs the Lance 6.0 distributed-cache benchmark on one
+This guide runs the Lance 7.0 distributed-cache benchmark on one
 coordinator/head node, two actor nodes, and a separate MinIO node. The
 example pins `--mode replicated --num-actors 2 --scenario distributed`
 as the cross-build-safe topology: each actor caches the full partition
@@ -17,18 +17,19 @@ raises a clear `RuntimeError` on first use, so an end-to-end sharded
 run requires verifying that build first (see
 [`plans/benchmark/lance-v6-api-verification.md`](../../plans/benchmark/lance-v6-api-verification.md)).
 
-The wider v6 design is documented in
-[`plans/benchmark/lance-distributed-cache-6.0.md`](../../plans/benchmark/lance-distributed-cache-6.0.md);
+The wider distributed-cache design is documented in the benchmark plan
+directory;
 the v4 plan
 [`plans/benchmark/lance-hybrid-cache-ivf-rq.md`](../../plans/benchmark/lance-hybrid-cache-ivf-rq.md)
-is superseded by the v6 plan and is preserved as a historical
+is superseded by the distributed-cache plan and is preserved as a historical
 reference only.
 
 ## Pylance build
 
-Pin `../lance-open-source` to branch `private-cache-6.0-ver-1` at
-commit `9ebfe4de0` or newer. Build pylance from that local checkout
-rather than pulling from PyPI; the v6 distributed-cache surface
+Use a local `../lance-open-source` checkout with the cache + prewarm
+distributed-cache feature and a Python API compatible with the
+`private-cache-7.0-ver-1` line. Build pylance from that local checkout
+rather than pulling from PyPI; the Lance 7.0 distributed-cache surface
 (`Session.with_distributed_cache`, `Session.invalidate_index_cache`,
 `Session.size_bytes`, and the strict
 `dataset.prewarm_index(name, partition_ids=...)` path) is not on
@@ -559,7 +560,7 @@ The expected console shape for Run 1 is:
   per-query latency percentiles; under `--mode sharded` they report
   `bytes=<Session.size_bytes()>  owned=<count>  calls_handled=<count>`
   (no per-query latency on the worker side because the coordinator
-  owns the timer). The v4 `hit_ratio=...` column is gone — Lance 6.0
+  owns the timer). The v4 `hit_ratio=...` column is gone — Lance 7.0
   has no hit-ratio counters.
 - `=== L2 residency check: post-prewarm ===` (if
   `--pre-measure-residency-probe` is enabled) and
@@ -569,7 +570,7 @@ The expected console shape for Run 1 is:
   l1_bytes=<bytes> probe=<seconds>` — file presence under
   `{l2_dir}/v1/{sanitize(prefix)}/part-ivf-{id}.bin` one-to-one maps
   to L2 residency under the v6 layout. The L1 half is a session-wide
-  `Session.size_bytes()` readout; Lance 6.0 has no no-load L1 probe,
+  `Session.size_bytes()` readout; Lance 7.0 has no no-load L1 probe,
   so the v4 per-partition `in_l1` / `not_in_l1` lists and the
   `l2_source=...` inference field are gone.
 - `=== L2 directory snapshot (post-measure) ===` with per-actor lines
@@ -607,7 +608,7 @@ bench run sharing the same L2 path) the row is reported with empty
 `in_l2`, full `missing`, and the conflicting names listed in
 `l2_prefix_dirs` so the operator notices instead of seeing a stale-
 prefix-masked "healthy" report. The L1 half is a session-wide
-`Session.size_bytes()` readout, returned in the same RPC (Lance 6.0
+`Session.size_bytes()` readout, returned in the same RPC (Lance 7.0
 has no no-load L1 probe).
 
 Adding `--pre-measure-residency-probe` enables a second probe between
