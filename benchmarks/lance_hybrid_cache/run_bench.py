@@ -343,8 +343,10 @@ def main() -> int:
             result = ray.get(future)
             result["repeat"] = repeat
             if scenario["kind"] == "distributed":
-                # Snapshot after the actor has called sess.close(), so the
-                # distributed cache has flushed and released its file lock.
+                # Snapshot after the actor returns. On the v6 distributed cache
+                # L2 writes are durable at prewarm time (wait_for_disk), not at
+                # close, so the post-run snapshot is valid even though v6 has no
+                # Session.close() (see ScenarioActor.run / HybridSearchActor.close).
                 l2_post = snapshot_l2_dir(spec_for_actor["l2_dir"])
                 result["l2_pre_snapshot"] = l2_pre
                 result["l2_post_snapshot"] = l2_post

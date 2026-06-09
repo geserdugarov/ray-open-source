@@ -619,16 +619,36 @@ class HybridSearchActor:
         """Release session resources and the L2 directory flock.
 
         Foyer's NVMe L2 region files are held under an exclusive
-        ``{l2_dir}/lance-hybrid.lock``; close drops it so a subsequent
-        bench run on the same ``l2_dir`` can attach. Vector partition
-        durability does not depend on close — under the
+        ``{l2_dir}/lance-distributed.lock``; close drops it so a
+        subsequent bench run on the same ``l2_dir`` can attach. Vector
+        partition durability does not depend on close — under the
         no-vector-L1-writeback policy partitions are written to L2 at
         deterministic prewarm time (``wait_for_disk=True`` blocks until
         foyer's storage flusher confirms the write) and never flow back
         from L1 to L2 during normal query traffic. Idempotent for
         default (Moka) sessions.
+
+        ``Session.close()`` only exists on the v4 cache fork; the entire
+        Lance 7.0 distributed-cache line and newer drops it
+        and releases the flock when the Session is *dropped*. Because the
+        actor pins the session and dataset on ``self``, a v6 Session would
+        otherwise outlive this call and keep the flock held until
+        ``ray.kill`` tears the process down — which would make
+        ``ray.get([a.close.remote() ...])`` a misleading cleanup barrier.
+        So close explicitly on any build that still has ``Session.close()``,
+        then drop the actor-held references. Dropping the dataset first
+        releases its Rust-side handle on the Session; clearing ``self._sess``
+        then takes the last reference, so CPython refcounting frees the v6
+        Session synchronously and the flock is gone before this returns. A
+        second call sees ``None`` and is a no-op.
         """
-        self._sess.close()
+        if hasattr(self._sess, "close"):
+            self._sess.close()
+        # Release the v6 Session by dropping every actor-held reference:
+        # the dataset pins the Session, so both must go for the flock to
+        # be released here rather than at ray.kill time.
+        self._ds = None
+        self._sess = None
 
 
 @ray.remote

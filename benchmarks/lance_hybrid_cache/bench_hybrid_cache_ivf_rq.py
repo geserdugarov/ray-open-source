@@ -254,7 +254,14 @@ class ScenarioActor:
         latencies_by_k = measure(ds, measure_vectors, k_list, nprobes=nprobes)
         stats_post = size_bytes_stats(sess)
 
-        sess.close()
+        # `Session.close()` existed in the v4 cache fork but was removed across
+        # the Lance 7.0 distributed-cache line and newer: the
+        # exclusive `{l2_dir}/lance-distributed.lock` flock is released when the
+        # Session is dropped and the actor process exits (`ray.kill` follows in
+        # the driver). Guard the call so the bench runs on the v6 builds that
+        # have no `close()` and still closes explicitly on any build retaining it.
+        if hasattr(sess, "close"):
+            sess.close()
         return {
             "name": name,
             "stats_pre": stats_pre,

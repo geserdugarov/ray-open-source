@@ -491,17 +491,20 @@ docker compose -f infra/docker-compose.yml down -v
 
 ## Pitfalls
 
-- **`session.close()` releases the L2 flock** — close the session at the
-  end of every run so the v6 backend drops
-  `{l2_dir}/lance-distributed.lock` and the next run on the same
-  `l2_dir` can attach. Vector-partition durability does *not* depend on
-  close: the v6 strict prewarm path
-  (`dataset.prewarm_index(name, partition_ids=...)`) writes each
+- **Dropping the session releases the L2 flock** — the v6 backend exposes
+  no `Session.close()`; it releases `{l2_dir}/lance-distributed.lock` when
+  the Session object is *dropped*. End every run by letting the session
+  (and the dataset that pins it) go out of scope so the next run on the
+  same `l2_dir` can attach. `ScenarioActor.run` does this by returning —
+  its `sess`/`ds` locals are freed on return — and `HybridSearchActor.close`
+  does it by clearing its `self._sess`/`self._ds` references (it still
+  calls `Session.close()` first on the v4 fork that retains it). Vector-
+  partition durability does *not* depend on this: the v6 strict prewarm
+  path (`dataset.prewarm_index(name, partition_ids=...)`) writes each
   `part-ivf-{id}.bin` atomically (`tmp-{nonce}` → `fsync` → `rename`
   → `fsync(parent)`), so a crash mid-prewarm leaves no half-written
-  files. The local `ScenarioActor.run` and `HybridSearchActor.close`
-  already release the session; don't wrap them in a bare try that
-  swallows exceptions or the flock stays held until process exit.
+  files. Don't stash the session in a longer-lived reference, or the
+  flock stays held until the actor process exits.
 - **`l2_dir` is exclusive per process** — the v6 backend takes an
   exclusive advisory lock on `{l2_dir}/lance-distributed.lock` for the
   lifetime of the session, and `Session.with_distributed_cache(...)`
