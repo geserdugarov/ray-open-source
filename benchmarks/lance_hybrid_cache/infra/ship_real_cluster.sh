@@ -47,6 +47,13 @@ for path in \
   fi
 done
 
+# Clean/guard stage: refuse to ship a wheelhouse that would install the wrong
+# pylance (duplicate pylance wheels, or a lance-namespace >=0.8 that makes pip
+# silently backtrack to an older pylance). rsync --delete below mirrors this
+# wheelhouse onto every node, so verifying it here is the cluster-side clean
+# gate. Rebuild a clean wheelhouse with infra/build_wheelhouse.sh if this fails.
+bash "$RAY_CHECKOUT/benchmarks/lance_hybrid_cache/infra/verify_wheelhouse.sh" "$WHEELHOUSE"
+
 ship_ray_node() {
   local role="$1"
   local host="$2"

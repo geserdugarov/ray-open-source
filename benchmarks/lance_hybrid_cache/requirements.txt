@@ -16,7 +16,15 @@
 # plans/benchmark/lance-v6-api-verification.md for the current binding
 # status against a candidate pylance build.
 ray[default]>=2.40
-lance-namespace>=0.5.2
+# Must stay inside the local pylance's own pin (pyproject.toml:
+# `lance-namespace>=0.7.7,<0.8`). A looser pin here (e.g. `>=0.5.2`) lets
+# `pip wheel -r requirements.txt` stage lance-namespace 0.8.x into the
+# wheelhouse, which then violates the local pylance 7.0.0 wheel's `<0.8`
+# upper bound. Under `pip install --no-index` pip cannot satisfy pylance
+# 7.0.0's deps offline, so it SILENTLY backtracks to whatever older pylance
+# wheel is also present (e.g. a stale 4.0.0) — a build with no
+# `dataset.prewarm_index(partition_ids=...)`. Keep this aligned with pylance.
+lance-namespace>=0.7.7,<0.8
 numpy>=1.26
 pyarrow>=15
 matplotlib>=3.8

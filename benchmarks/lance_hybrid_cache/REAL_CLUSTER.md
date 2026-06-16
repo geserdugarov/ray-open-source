@@ -252,17 +252,41 @@ cd "$HOME/git/ray-open-source/python"
 pip wheel . -w "$HOME/git/ray-open-source/dist" --no-deps
 # Produces dist/ray-3.0.0.dev0-cp312-cp312-linux_x86_64.whl
 
-# pylance wheel. The PyPI/distribution name is `pylance`; the Python import
-# remains `lance`.
-cd "$HOME/git/lance-open-source/python"
-maturin build --release --out dist
-
-# Wheelhouse: pre-resolve every dep so Ray nodes do zero compilation.
+# Wheelhouse: clean stale wheels, build pylance, pre-resolve every dep, stage
+# the local Ray + pylance wheels, then verify. Run this instead of the manual
+# maturin / pip wheel / cp sequence — the clean + verify stages are what keep
+# a stale wheel from shipping (see "Wheel hygiene" below).
 cd "$HOME/git/ray-open-source/benchmarks/lance_hybrid_cache"
-pip wheel -r requirements.txt -w "$HOME/wheelhouse"
-cp "$HOME/git/ray-open-source/dist/"ray-*.whl "$HOME/wheelhouse/"
-cp "$HOME/git/lance-open-source/python/dist/"pylance-*.whl "$HOME/wheelhouse/"
+bash infra/build_wheelhouse.sh
 ```
+
+`build_wheelhouse.sh` purges every prior `pylance-*` / `lance_namespace-*`
+wheel from both `lance-open-source/python/dist` and `$HOME/wheelhouse`, runs
+`maturin build --release`, runs `pip wheel -r requirements.txt`, copies in the
+Ray wheel (from `$HOME/git/ray-open-source/dist`) and the single fresh pylance
+wheel, then runs `infra/verify_wheelhouse.sh` to assert exactly one pylance
+wheel, a compatible `lance-namespace` (`<0.8`), and that the wheel actually
+exposes `dataset.prewarm_index(partition_ids=...)`.
+
+#### Wheel hygiene (why the clean + verify stages exist)
+
+`maturin build --out dist` never cleans `dist/`, and `cp pylance-*.whl` +
+`rsync --delete` faithfully propagate whatever is there. Two stale-artifact
+traps have silently installed the *wrong* Lance on the cluster:
+
+- **Duplicate pylance wheels.** A leftover older build (e.g.
+  `pylance-4.0.0-…`) sits next to the new `pylance-7.0.0-…`. `pip install
+  --find-links pylance` resolves *by name* and may prefer the wrong one.
+- **`lance-namespace` version conflict.** pylance pins
+  `lance-namespace>=0.7.7,<0.8`; a looser pin in `requirements.txt` lets
+  `pip wheel` stage `lance-namespace 0.8.x`, which violates that ceiling.
+  Under `--no-index` pip then cannot satisfy pylance 7.0.0 offline and
+  **silently backtracks** to an older pylance whose deps it *can* satisfy —
+  installing a build with no `partition_ids` prewarm path.
+
+`build_wheelhouse.sh` (clean stage) and `verify_wheelhouse.sh` (guard, also
+run automatically by `ship_real_cluster.sh` before any rsync) make both cases
+a hard, loud failure instead of a silent wrong-version install.
 
 ### 2. On dev: ship wheelhouse and benchmark source
 
@@ -315,11 +339,23 @@ source "$HOME/git/ray-open-source/python/venv/bin/activate"
 pip install --no-index --find-links="$HOME/wheelhouse" \
     ray pylance \
     -r "$HOME/git/ray-open-source/benchmarks/lance_hybrid_cache/requirements.txt"
+
+# Verify the intended build actually installed on THIS node. A silent backtrack
+# to an older pylance prints a different version and/or `partition_ids: False`.
+python -c "import lance, inspect; from lance.dataset import LanceDataset as D; \
+print('lance', lance.__version__, '| partition_ids:', \
+'partition_ids' in inspect.signature(D.prewarm_index).parameters)"
+# expect on every node: lance 7.0.0 | partition_ids: True
 ```
 
 `--no-index` forbids PyPI fallback, so a missing wheel fails fast instead of
 silently triggering a source build. `pylance` installs the package imported as
-`lance`.
+`lance`. The per-node verify line is not optional: with a clean wheelhouse the
+`--no-index` resolve is unambiguous, but the check is the cheapest way to catch
+a node that was missed by the wipe or shipped a stale wheelhouse. If a node
+already had an install (you did not wipe its venv first), add
+`--force-reinstall` — both builds are version `7.0.0`, so plain `pip install`
+treats it as already satisfied and keeps the stale module.
 
 ### Iterating after the initial deploy
 
@@ -327,10 +363,15 @@ Always rebuild on this dev machine, never on a Ray node:
 
 - Benchmark driver/helper edits under `benchmarks/lance_hybrid_cache/`: re-run
   `infra/ship_real_cluster.sh`. No wheel rebuild.
-- Lance Python or Rust edits: rebuild on dev with `maturin build --release`,
-  copy the new `pylance` wheel into `$HOME/wheelhouse/`, run
-  `infra/ship_real_cluster.sh`, then on each host run
+- Lance Python or Rust edits: rebuild a clean wheelhouse on dev with
+  `bash infra/build_wheelhouse.sh` (purges the old pylance wheel so it can't
+  shadow the new one and re-verifies the result), run
+  `infra/ship_real_cluster.sh` (which re-verifies the wheelhouse before
+  rsyncing), then on each host run
   `pip install --force-reinstall --no-deps "$HOME/wheelhouse"/pylance-*.whl`.
+  `--force-reinstall` is required because the version string does not change
+  between builds (both are `pylance-7.0.0`), so plain `pip install` treats it
+  as already satisfied and keeps the stale module.
 - Ray package edits outside this benchmark directory: rebuild the Ray wheel and
   redeploy to all three Ray nodes.
 
