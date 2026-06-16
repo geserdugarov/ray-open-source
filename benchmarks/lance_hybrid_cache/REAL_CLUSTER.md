@@ -277,12 +277,17 @@ traps have silently installed the *wrong* Lance on the cluster:
 - **Duplicate pylance wheels.** A leftover older build (e.g.
   `pylance-4.0.0-…`) sits next to the new `pylance-7.0.0-…`. `pip install
   --find-links pylance` resolves *by name* and may prefer the wrong one.
-- **`lance-namespace` version conflict.** pylance pins
-  `lance-namespace>=0.7.7,<0.8`; a looser pin in `requirements.txt` lets
-  `pip wheel` stage `lance-namespace 0.8.x`, which violates that ceiling.
-  Under `--no-index` pip then cannot satisfy pylance 7.0.0 offline and
-  **silently backtracks** to an older pylance whose deps it *can* satisfy —
-  installing a build with no `partition_ids` prewarm path.
+- **`lance-namespace` version conflict.** A too-*loose* pin lets `pip wheel`
+  stage `lance-namespace 0.8.x`, which violates the pylance wheel's `<0.8`
+  ceiling; under `--no-index` pip then cannot satisfy pylance 7.0.0 offline and
+  **silently backtracks** to an older pylance with no `partition_ids` prewarm
+  path. A too-*tight* floor is the opposite failure: the internal cluster pylance
+  pins an exact pre-release `lance-namespace==0.7.7rc0+h0.cbu.mrs.370.r1`, and a
+  `>=0.7.7` floor excludes it (`0.7.7rc0 < 0.7.7`) → `ResolutionImpossible`.
+  `requirements.txt` therefore uses `lance-namespace>=0.7.7rc0,<0.8`. That
+  rc0+local wheel is **not on PyPI**, so the cluster wheelhouse must carry it
+  next to the pylance wheel (final `0.7.7` from PyPI alone won't satisfy the
+  exact `==` pin); the open-source pylance build still resolves to final `0.7.7`.
 
 `build_wheelhouse.sh` (clean stage) and `verify_wheelhouse.sh` (guard, also
 run automatically by `ship_real_cluster.sh` before any rsync) make both cases

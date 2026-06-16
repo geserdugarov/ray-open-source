@@ -60,8 +60,12 @@ log "build: maturin build --release (pylance) from $LANCE_CHECKOUT/python"
 ( cd "$LANCE_CHECKOUT/python" && maturin build --release --out "$LANCE_DIST" )
 
 # --- Stage 3: pre-resolve every dependency into the wheelhouse ---------------
-# Uses the corrected lance-namespace pin in requirements.txt (>=0.7.7,<0.8),
-# so the staged lance-namespace is compatible with the pylance 7.0.0 wheel.
+# Uses the lance-namespace pin in requirements.txt (>=0.7.7rc0,<0.8), so the
+# staged lance-namespace is compatible with the pylance 7.0.0 wheel — including
+# the internal cluster build that pins `==0.7.7rc0+h0.cbu.mrs.370.r1`. NOTE: that
+# rc0+local wheel is not on PyPI, so `pip wheel` here stages final 0.7.7; the
+# cluster wheelhouse must additionally carry the rc0+local wheel for the internal
+# pylance to resolve under `--no-index`.
 log "deps: pip wheel -r requirements.txt -> $WHEELHOUSE"
 pip wheel -r "$REQS" -w "$WHEELHOUSE"
 

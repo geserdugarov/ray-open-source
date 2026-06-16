@@ -9,10 +9,13 @@
 #   1. More than one pylance wheel present -> `pip install --find-links pylance`
 #      resolves by name and may prefer the wrong one (higher version, or a
 #      more-specific tag).
-#   2. A lance-namespace wheel >=0.8 present -> conflicts with pylance 7.0.0's
-#      `lance-namespace>=0.7.7,<0.8` pin, so `pip install --no-index` cannot
-#      satisfy pylance 7.0.0 offline and silently backtracks to an older
-#      pylance wheel.
+#   2. A lance-namespace wheel >=0.8 present -> conflicts with the pylance 7.0.0
+#      wheel's lance-namespace upper bound (`<0.8`), so `pip install --no-index`
+#      cannot satisfy pylance 7.0.0 offline and silently backtracks to an older
+#      pylance wheel. (The internal cluster pylance pins an exact pre-release,
+#      `lance-namespace==0.7.7rc0+h0.cbu.mrs.370.r1`; requirements.txt uses
+#      `>=0.7.7rc0,<0.8` to admit it. A `0.7.7rc0+...` wheel is below 0.8 so it
+#      is NOT flagged here.)
 #
 # It also confirms the single pylance wheel actually exposes the
 # partition_ids prewarm API (catches a wheel built from a too-old commit).
@@ -44,7 +47,7 @@ bad_ns=( "$WHEELHOUSE"/lance_namespace-0.8*.whl \
   || fail "incompatible lance-namespace wheel(s) present (pylance needs <0.8): ${bad_ns[*]##*/}"
 ns=( "$WHEELHOUSE"/lance_namespace-*.whl )
 (( ${#ns[@]} >= 1 )) \
-  || fail "no lance-namespace wheel staged (pylance needs >=0.7.7,<0.8)"
+  || fail "no lance-namespace wheel staged (pylance needs >=0.7.7rc0,<0.8)"
 log "ok: lance-namespace wheel(s): ${ns[*]##*/}"
 
 # 2b. At most one ray wheel. A locally built ray (e.g. the 2.53.0 branch build)
