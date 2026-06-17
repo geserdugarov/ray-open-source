@@ -32,6 +32,24 @@ import numpy as np
 import ray
 
 
+def _filter_partition_ids(
+    partition_ids: List[int],
+    allowed_partition_ids: "set[int] | None",
+) -> List[int]:
+    """Dedupe partition ids while optionally intersecting an allow-list."""
+    out: List[int] = []
+    seen: set[int] = set()
+    for raw_pid in partition_ids:
+        pid = int(raw_pid)
+        if pid in seen:
+            continue
+        if allowed_partition_ids is not None and pid not in allowed_partition_ids:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
+
+
 def _merge_top_k(
     partials: List[Tuple[np.ndarray, np.ndarray]], k: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -114,6 +132,7 @@ class HybridSearchActor:
         # report fan-out balance per actor without timing them inside
         # the worker (the coord owns per-query latency).
         self._n_searches_handled: int = 0
+        self._n_search_partitions_filtered: int = 0
 
     def _validate_l2_partition_files(self, expected_ids: List[int]) -> Dict[str, Any]:
         """Walk the actor-local L2 dir to verify sharded prewarm placement.
@@ -195,10 +214,13 @@ class HybridSearchActor:
         """Force only this actor's slice of partitions into the cache.
 
         Counterpart to ``prewarm_index`` for partition-sharded topologies.
-        Driver assigns each actor a disjoint subset of partition ids
-        (e.g. ``partition_id % num_actors``); the actor stashes them so
-        ``measure_sharded`` can intersect routed partitions against its
-        own slice without the driver re-sending them per query.
+        Driver assigns each actor a disjoint subset of non-empty
+        partition ids (e.g. ``partition_id % num_actors``); the actor
+        stashes them so ``measure_sharded`` can intersect routed
+        partitions against its own slice without the driver re-sending
+        them per query. Empty IVF partitions are intentionally absent
+        because Lance's builder does not write partition payload files
+        for them.
 
         Lance 7.0 port: calls ``dataset.prewarm_index(name,
         partition_ids=...)`` — the strict v6 path that writes one
@@ -483,10 +505,12 @@ class HybridSearchActor:
         Coordinator-driven counterpart to ``measure_sharded``: the coord
         has already done the centroid step, has already filtered the
         nprobes ids by ownership, and just wants this replica's partial
-        result so it can merge across workers. Returns the per-partition
-        candidates as numpy arrays so the coord's merge is a cheap
-        ``np.argpartition`` over numpy concatenation rather than a
-        cross-process pyarrow round-trip.
+        result so it can merge across workers. The actor intersects the
+        request with its registered owned-partition set as a final guard
+        against routing empty / unowned partitions into Lance. Returns
+        the per-partition candidates as numpy arrays so the coord's
+        merge is a cheap ``np.argpartition`` over numpy concatenation
+        rather than a cross-process pyarrow round-trip.
 
         Requires :meth:`prewarm_partitions` to have run first. Errors
         otherwise rather than silently scanning empty cache.
@@ -502,14 +526,20 @@ class HybridSearchActor:
                 "needs the partition-sharded IVF primitives "
                 "(lance commit 4078a83b or later)"
             )
-        if not partition_ids:
+        filtered_partition_ids = _filter_partition_ids(
+            partition_ids, self._owned_partitions
+        )
+        self._n_search_partitions_filtered += max(
+            0, len(partition_ids) - len(filtered_partition_ids)
+        )
+        if not filtered_partition_ids:
             return (
                 np.empty(0, dtype=np.float32),
                 np.empty(0, dtype=np.uint64),
             )
         qa = np.asarray(query, dtype=np.float32)
         rb = self._ds.search_partitions(
-            self._sharded_index_name, qa, list(partition_ids), k
+            self._sharded_index_name, qa, filtered_partition_ids, k
         )
         self._n_searches_handled += 1
         # Materialise into numpy now so the over-the-wire payload to the
@@ -612,6 +642,7 @@ class HybridSearchActor:
             "actor_id": self._actor_id,
             "stats_post": self._size_bytes_stats(self._sess),
             "n_searches_handled": int(self._n_searches_handled),
+            "n_search_partitions_filtered": int(self._n_search_partitions_filtered),
             "owned_partitions": len(self._owned_partitions),
         }
 
@@ -656,12 +687,12 @@ class CoordinatorActor:
     """Routing actor for the partition-sharded full-recall topology.
 
     Owns the IVF centroid step (cheap, metadata-only) and the
-    partition→actor mapping. Per query it groups the nprobes routed
-    partitions by owning worker, scatter-gathers ``search_partitions``
-    in parallel across workers, and merges per-worker partial top-K
-    into a final top-K. Workers must already be alive and registered
-    by name (``hybrid-search-actor-<i>``) when the coordinator
-    initialises.
+    partition→actor mapping. Per query it drops known-empty partitions,
+    groups the remaining nprobes routed partitions by owning worker,
+    scatter-gathers ``search_partitions`` in parallel across workers,
+    and merges per-worker partial top-K into a final top-K. Workers
+    must already be alive and registered by name
+    (``hybrid-search-actor-<i>``) when the coordinator initialises.
 
     The coordinator never loads partition data and never uses an L2
     NVMe tier — it only opens the dataset for the centroid metadata,
@@ -677,6 +708,7 @@ class CoordinatorActor:
         num_actors: int,
         worker_names: List[str],
         metadata_bytes: int | None = None,
+        valid_partition_ids: List[int] | None = None,
     ):
         import lance
         from _hybrid_cache_helpers import minio_storage_options
@@ -690,6 +722,11 @@ class CoordinatorActor:
         self._index_name = index_name
         self._nprobes = nprobes
         self._num_actors = num_actors
+        self._valid_partition_ids = (
+            {int(p) for p in valid_partition_ids}
+            if valid_partition_ids is not None
+            else None
+        )
 
         # DRAM-only Session: routing only needs the centroid metadata.
         # Sized small so the coord never contends with workers for NVMe.
@@ -816,8 +853,11 @@ class CoordinatorActor:
                     self._index_name, qa, self._nprobes
                 )
                 buckets: List[List[int]] = [[] for _ in range(self._num_actors)]
-                for pid in partition_ids:
-                    buckets[int(pid) % self._num_actors].append(int(pid))
+                for pid in _filter_partition_ids(
+                    [int(p) for p in partition_ids],
+                    self._valid_partition_ids,
+                ):
+                    buckets[pid % self._num_actors].append(pid)
                 t_centroid = time.perf_counter() - t0
 
                 # 2. Scatter to non-empty buckets in parallel.

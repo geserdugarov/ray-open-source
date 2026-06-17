@@ -77,6 +77,7 @@ from _hybrid_cache_helpers import (  # noqa: E402
     DatasetSpec,
     ensure_dataset,
     format_latency_row,
+    load_index_partition_sizes,
     make_query_vectors,
     percentiles,
 )
@@ -152,16 +153,18 @@ def _assert_l2_validation_clean(prewarm_results: List[Dict[str, Any]]) -> None:
 
     ``HybridSearchActor.prewarm_partitions_deterministic`` returns an
     ``l2_validation`` block per actor (empty for non-distributed
-    sessions, which carry no L2 tier). For distributed sessions the v6
-    strict ``dataset.prewarm_index(name, partition_ids=...)`` path
-    either persisted every requested partition or raised
-    ``LanceError`` — so any non-zero ``missing_count`` here is a backend
-    regression and must abort the run rather than continue into a
-    measure phase that would silently scan partitions still served
-    from MinIO. ``extra_count != 0`` flags a stale-prefix collision
-    (two live ``v1/{prefix}/`` subdirs at the same ``l2_dir``); equally
-    fatal because the residency probe later refuses to claim a
-    residency under that ambiguity.
+    sessions, which carry no L2 tier). The driver passes only non-empty
+    IVF partitions into sharded prewarm, based on Lance index statistics.
+    For distributed sessions the v6 strict
+    ``dataset.prewarm_index(name, partition_ids=...)`` path should
+    persist every requested non-empty partition or raise ``LanceError``.
+    Any non-zero ``missing_count`` here is therefore a backend regression
+    and must abort the run rather than continue into a measure phase that
+    would silently scan partitions still served from MinIO.
+    ``extra_count != 0`` flags a stale-prefix collision (two live
+    ``v1/{prefix}/`` subdirs at the same ``l2_dir``); equally fatal
+    because the residency probe later refuses to claim a residency under
+    that ambiguity.
     """
     failures: List[str] = []
     for r in prewarm_results:
@@ -188,6 +191,19 @@ def _assert_l2_validation_clean(prewarm_results: List[Dict[str, Any]]) -> None:
             "partition or raise LanceError; "
             f"{len(failures)} actor(s) reported drift:\n  " + "\n  ".join(failures)
         )
+
+
+def _partition_ids_by_actor(
+    partition_ids: List[int],
+    num_actors: int,
+) -> List[List[int]]:
+    """Assign valid IVF partition ids to actors by ``partition_id % N``."""
+    if num_actors <= 0:
+        raise ValueError(f"num_actors must be > 0; got {num_actors}")
+    owned: List[List[int]] = [[] for _ in range(num_actors)]
+    for pid in sorted({int(p) for p in partition_ids}):
+        owned[pid % num_actors].append(pid)
+    return owned
 
 
 def _nonneg_int(value: str) -> int:
@@ -549,7 +565,9 @@ def _run_measure_pass(
     """
     if mode == "sharded":
         if coord is None:
-            raise ValueError("_run_measure_pass: coord must be set under --mode sharded")
+            raise ValueError(
+                "_run_measure_pass: coord must be set under --mode sharded"
+            )
         t_measure_start = time.time()
         coord_result = ray.get(coord.search_batch.remote(measure_qs.tolist(), k_list))
         measure_wall_s = time.time() - t_measure_start
@@ -648,9 +666,7 @@ def _run_invalidation_drill(
     log it inline.
     """
     print("\n=== Phase 2.7: invalidation drill ===")
-    measure1_summary = {
-        int(k): percentiles(first_pass_aggregated[k]) for k in k_list
-    }
+    measure1_summary = {int(k): percentiles(first_pass_aggregated[k]) for k in k_list}
 
     # Step 1: invalidate per worker; coord too in --mode sharded.
     print(
@@ -660,10 +676,7 @@ def _run_invalidation_drill(
     )
     t_inv = time.time()
     inv_results = ray.get(
-        [
-            a.invalidate_index_cache.remote(uri, args.index_name)
-            for a in actors
-        ]
+        [a.invalidate_index_cache.remote(uri, args.index_name) for a in actors]
     )
     coord_inv_result: Dict[str, Any] | None = None
     if coord is not None:
@@ -732,12 +745,9 @@ def _run_invalidation_drill(
     # the original prewarm used (sharded round-robin) so the rehydrated
     # cache is byte-for-byte equivalent to the post-prewarm state of
     # Phase 1.
-    policy, ram_bytes_budget = _deterministic_prewarm_params(
-        args.scenario, dram_bytes
-    )
+    policy, ram_bytes_budget = _deterministic_prewarm_params(args.scenario, dram_bytes)
     print(
-        f"[driver] re-running sharded prewarm (policy={policy!r}) — "
-        "cold L2 rehydration"
+        f"[driver] re-running sharded prewarm (policy={policy!r}) — cold L2 rehydration"
     )
     t_rehyd = time.time()
     rehyd_results = ray.get(
@@ -763,9 +773,7 @@ def _run_invalidation_drill(
         warmup_routing_q = make_query_vectors(1, args.dim, seed=args.seed + 3)[0]
         t_warm = time.time()
         ray.get(coord.warmup_routing.remote(warmup_routing_q.tolist()))
-        print(
-            f"[driver] coord routing rewarmup done in {time.time() - t_warm:.1f}s"
-        )
+        print(f"[driver] coord routing rewarmup done in {time.time() - t_warm:.1f}s")
 
     # Step 4: re-run measure. Drives the same query plan as the first
     # pass so percentile deltas are apples-to-apples.
@@ -782,9 +790,7 @@ def _run_invalidation_drill(
     second_aggregated = _aggregate_latencies_by_k(
         second_per_actor_results, second_coord_result, k_list
     )
-    measure2_summary = {
-        int(k): percentiles(second_aggregated[k]) for k in k_list
-    }
+    measure2_summary = {int(k): percentiles(second_aggregated[k]) for k in k_list}
     print(f"[driver] measure2 wall-time: {measure2_wall_s:.1f}s")
     for k in k_list:
         print(format_latency_row("measure2", k, measure2_summary[k]))
@@ -800,10 +806,18 @@ def _run_invalidation_drill(
 
     delta_by_k = {
         str(k): {
-            "delta_p50_pct": _pct_delta(measure2_summary[k]["p50"], measure1_summary[k]["p50"]),
-            "delta_p95_pct": _pct_delta(measure2_summary[k]["p95"], measure1_summary[k]["p95"]),
-            "delta_p99_pct": _pct_delta(measure2_summary[k]["p99"], measure1_summary[k]["p99"]),
-            "delta_mean_pct": _pct_delta(measure2_summary[k]["mean"], measure1_summary[k]["mean"]),
+            "delta_p50_pct": _pct_delta(
+                measure2_summary[k]["p50"], measure1_summary[k]["p50"]
+            ),
+            "delta_p95_pct": _pct_delta(
+                measure2_summary[k]["p95"], measure1_summary[k]["p95"]
+            ),
+            "delta_p99_pct": _pct_delta(
+                measure2_summary[k]["p99"], measure1_summary[k]["p99"]
+            ),
+            "delta_mean_pct": _pct_delta(
+                measure2_summary[k]["mean"], measure1_summary[k]["mean"]
+            ),
         }
         for k in k_list
     }
@@ -840,12 +854,8 @@ def _run_invalidation_drill(
         "delta_p99_pct": float(delta_p99_pct),
         "delta_mean_pct": float(delta_mean_pct),
         # Per-k breakdown for callers that drive --k-list with multiple ks.
-        "measure1_summary_by_k": {
-            str(k): measure1_summary[k] for k in k_list
-        },
-        "measure2_summary_by_k": {
-            str(k): measure2_summary[k] for k in k_list
-        },
+        "measure1_summary_by_k": {str(k): measure1_summary[k] for k in k_list},
+        "measure2_summary_by_k": {str(k): measure2_summary[k] for k in k_list},
         "delta_by_k": delta_by_k,
         # Per-actor invalidation detail + L2 verification.
         "invalidations": [
@@ -968,6 +978,30 @@ def main() -> int:
     else:
         uri = ensure_dataset(spec, bucket=args.bucket, endpoint_url=args.endpoint_url)
 
+    partition_sizes = load_index_partition_sizes(
+        uri,
+        args.endpoint_url,
+        args.index_name,
+        expected_num_partitions=args.num_partitions,
+    )
+    non_empty_partition_ids = [
+        pid for pid, size in enumerate(partition_sizes) if int(size) > 0
+    ]
+    empty_partition_ids = [
+        pid for pid, size in enumerate(partition_sizes) if int(size) == 0
+    ]
+    if empty_partition_ids:
+        print(
+            f"[driver] index stats: {len(empty_partition_ids)} empty IVF "
+            "partition(s) will be excluded from sharded ownership, L2 "
+            "validation, and coord routing; "
+            f"sample={empty_partition_ids[:32]}"
+        )
+    print(
+        f"[driver] index stats: non_empty_partitions="
+        f"{len(non_empty_partition_ids)}/{args.num_partitions}"
+    )
+
     warmup_qs = make_query_vectors(args.warmup_queries, args.dim, seed=args.seed + 1)
     measure_qs = make_query_vectors(args.measure_queries, args.dim, seed=args.seed + 2)
     print(
@@ -1068,19 +1102,20 @@ def main() -> int:
     t_start = time.time()
 
     # ── Phase 1: prewarm ──
-    # ``partitions_for_actor`` is the per-actor "expected" partition set
-    # consumed by the post-prewarm / post-measure residency probe. It is
-    # defined up-front so the probe works under any prewarm mode that
-    # has a well-defined expected set:
-    #   * forced: every actor caches every partition -> full range.
-    #   * sharded: round-robin slice (overwritten inside the branch).
+    # ``partitions_for_actor`` is the per-actor "expected" non-empty
+    # partition set consumed by sharded routing and by the post-prewarm /
+    # post-measure residency probe. Empty IVF partitions retain centroid
+    # ids but have no partition payload file, so they are intentionally
+    # absent from ownership and L2 validation.
+    #   * forced: every actor caches every non-empty partition.
+    #   * sharded: non-empty partition ids assigned by id % num_actors.
     # Modes without a defined expectation (natural, none) leave the
     # default empty slices and the probe is gated off below.
     partitions_for_actor: List[List[int]] = [[] for _ in range(args.num_actors)]
 
     if args.prewarm == "forced":
         partitions_for_actor = [
-            list(range(args.num_partitions)) for _ in range(args.num_actors)
+            list(non_empty_partition_ids) for _ in range(args.num_actors)
         ]
         print(
             f"[driver] forced prewarm — {args.num_actors} actors "
@@ -1117,15 +1152,16 @@ def main() -> int:
                 f"duration={r['duration_s']:.1f}s"
             )
     elif args.prewarm == "sharded":
-        # Round-robin assignment by partition id. Centroids are uniformly
-        # learned over the whole dataset, so partition ids carry no spatial
-        # ordering — striding by num_actors balances load without needing
-        # a count-based scheme. If a future workload shows skew, swap this
-        # for an assignment that weights by per-partition row count.
-        partitions_for_actor = [
-            list(range(i, args.num_partitions, args.num_actors))
-            for i in range(args.num_actors)
-        ]
+        # Round-robin assignment by partition id, restricted to non-empty
+        # IVF partitions. Centroids are uniformly learned over the whole
+        # dataset, so partition ids carry no spatial ordering — striding
+        # by num_actors balances load without needing a count-based
+        # scheme. If a future workload shows skew, swap this for an
+        # assignment that weights by per-partition row count.
+        partitions_for_actor = _partition_ids_by_actor(
+            non_empty_partition_ids,
+            args.num_actors,
+        )
         sizes = [len(p) for p in partitions_for_actor]
         if args.scenario == "no-cache":
             # No cache to fill; loading partitions through a no-op cache
@@ -1386,6 +1422,7 @@ def main() -> int:
             num_actors=args.num_actors,
             worker_names=worker_names,
             metadata_bytes=metadata_bytes,
+            valid_partition_ids=non_empty_partition_ids,
         )
         # Block on coord __init__ (opens the dataset over MinIO, resolves
         # worker handles) so its setup time is not charged to measure_wall_s.

@@ -13,7 +13,7 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -36,7 +36,9 @@ class DatasetSpec:
     seed: int = 42
 
     def content_hash(self) -> str:
-        raw = f"{self.scale}|{self.dim}|{self.num_partitions}|{self.num_bits}|{self.seed}"
+        raw = (
+            f"{self.scale}|{self.dim}|{self.num_partitions}|{self.num_bits}|{self.seed}"
+        )
         return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
     def uri(self, bucket: str) -> str:
@@ -48,9 +50,7 @@ def minio_storage_options(endpoint_url: str) -> Dict[str, str]:
     return {
         "aws_endpoint": endpoint_url,
         "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
-        "aws_secret_access_key": os.environ.get(
-            "AWS_SECRET_ACCESS_KEY", "minioadmin"
-        ),
+        "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
         "aws_region": os.environ.get("AWS_REGION", "us-east-1"),
         "allow_http": "true",
     }
@@ -142,7 +142,9 @@ def ensure_dataset(
         log(f"[setup] wrote dataset in {time.time() - t0:.1f}s")
         existing = lance.dataset(uri, storage_options=storage_options)
     else:
-        log(f"[setup] dataset present but no vector index at {uri}; building index only")
+        log(
+            f"[setup] dataset present but no vector index at {uri}; building index only"
+        )
 
     log(
         f"[setup] building IVF_RQ index "
@@ -306,9 +308,7 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
                 return str(value)
         candidates.append(d)
     if candidates:
-        attrs = sorted(
-            a for a in dir(candidates[0]) if not a.startswith("_")
-        )
+        attrs = sorted(a for a in dir(candidates[0]) if not a.startswith("_"))
         raise RuntimeError(
             f"resolve_index_addr: index {index_name!r} present but no "
             f"address found on descriptor (attrs={attrs}); needs a "
@@ -320,6 +320,86 @@ def resolve_index_addr(ds: "lance.LanceDataset", index_name: str) -> str:
         f"resolve_index_addr: index {index_name!r} not found on dataset; "
         "is --index-name correct and was the index built?"
     )
+
+
+def extract_partition_sizes_from_index_stats(
+    index_stats: Dict[str, Any],
+) -> List[int]:
+    """Return per-IVF-partition row counts from Lance index statistics.
+
+    Lance keeps centroid slots for empty IVF partitions, but the builder
+    skips writing partition payloads for them. The benchmark must route
+    only partitions whose statistics report ``size > 0``; otherwise a
+    centroid id for an empty partition can fall through to a partition
+    read path even though no ``part-ivf-<id>.bin`` should exist.
+
+    Handles both the current ``{"indices": [{"partitions": ...}]}``
+    shape and the older direct ``{"partitions": ...}`` shape.
+    Multiple index segments are summed per partition.
+    """
+    raw_indices = index_stats.get("indices")
+    if isinstance(raw_indices, list) and raw_indices:
+        entries: Sequence[Dict[str, Any]] = raw_indices
+    elif "partitions" in index_stats:
+        entries = [index_stats]
+    else:
+        raise RuntimeError(
+            "index statistics do not contain per-partition sizes; "
+            f"top-level keys={sorted(index_stats.keys())}"
+        )
+
+    sizes: List[int] = []
+    saw_partitions = False
+    for entry in entries:
+        partitions = entry.get("partitions")
+        if partitions is None:
+            continue
+        saw_partitions = True
+        if len(sizes) < len(partitions):
+            sizes.extend([0] * (len(partitions) - len(sizes)))
+        for pid, part in enumerate(partitions):
+            if isinstance(part, dict):
+                raw_size = part.get("size", 0)
+            else:
+                raw_size = getattr(part, "size", 0)
+            sizes[pid] += int(raw_size or 0)
+
+    if not saw_partitions:
+        raise RuntimeError(
+            "index statistics contained index entries but no per-partition size blocks"
+        )
+    return sizes
+
+
+def load_index_partition_sizes(
+    uri: str,
+    endpoint_url: str,
+    index_name: str,
+    *,
+    expected_num_partitions: int | None = None,
+) -> List[int]:
+    """Open ``uri`` and return per-partition row counts for ``index_name``."""
+    ds = lance.dataset(uri, storage_options=minio_storage_options(endpoint_url))
+    stats_owner = getattr(ds, "stats", None)
+    if stats_owner is not None and hasattr(stats_owner, "index_stats"):
+        index_stats = stats_owner.index_stats(index_name)
+    elif hasattr(ds, "index_statistics"):
+        index_stats = ds.index_statistics(index_name)
+    else:
+        raise RuntimeError(
+            "this pylance build does not expose dataset.stats.index_stats "
+            "or dataset.index_statistics; cannot identify empty IVF partitions"
+        )
+
+    sizes = extract_partition_sizes_from_index_stats(index_stats)
+    if expected_num_partitions is not None and len(sizes) != expected_num_partitions:
+        raise RuntimeError(
+            f"index {index_name!r} reports {len(sizes)} partitions, but the "
+            f"benchmark was configured with --num-partitions="
+            f"{expected_num_partitions}; refusing to route with mismatched "
+            "partition metadata"
+        )
+    return sizes
 
 
 def build_session(spec: Dict[str, Any]):

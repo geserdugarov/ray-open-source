@@ -55,7 +55,11 @@ _fake_lance.LanceDataset = object
 sys.modules["lance"] = _fake_lance
 
 
-from _hybrid_cache_helpers import build_session, size_bytes_stats  # noqa: E402
+from _hybrid_cache_helpers import (  # noqa: E402
+    build_session,
+    extract_partition_sizes_from_index_stats,
+    size_bytes_stats,
+)
 from scenarios import (  # noqa: E402
     GIB,
     MIB,
@@ -227,6 +231,41 @@ class BuildSessionTest(unittest.TestCase):
     def test_unknown_kind_raises(self):
         with self.assertRaises(ValueError):
             build_session({"kind": "hybrid"})
+
+
+class IndexPartitionStatsTest(unittest.TestCase):
+    """Per-partition index stats identify intentionally empty IVF partitions."""
+
+    def test_extracts_current_index_stats_shape(self):
+        stats = {
+            "indices": [
+                {
+                    "partitions": [
+                        {"size": 10},
+                        {"size": 0},
+                        {"size": 7},
+                    ]
+                }
+            ]
+        }
+        self.assertEqual(extract_partition_sizes_from_index_stats(stats), [10, 0, 7])
+
+    def test_sums_multiple_index_segments(self):
+        stats = {
+            "indices": [
+                {"partitions": [{"size": 1}, {"size": 0}, {"size": 3}]},
+                {"partitions": [{"size": 4}, {"size": 5}, {"size": 0}]},
+            ]
+        }
+        self.assertEqual(extract_partition_sizes_from_index_stats(stats), [5, 5, 3])
+
+    def test_accepts_legacy_direct_partitions_shape(self):
+        stats = {"partitions": [{"size": 0}, {"size": 2}]}
+        self.assertEqual(extract_partition_sizes_from_index_stats(stats), [0, 2])
+
+    def test_raises_when_partition_sizes_are_unavailable(self):
+        with self.assertRaises(RuntimeError):
+            extract_partition_sizes_from_index_stats({"indices": [{"uuid": "abc"}]})
 
 
 class V6SessionStatsTest(unittest.TestCase):
@@ -811,6 +850,7 @@ def _make_actor_for_validation(l2_dir):
     actor._owned_partitions = set()
     actor._sharded_index_name = None
     actor._n_searches_handled = 0
+    actor._n_search_partitions_filtered = 0
     actor._l2_dir = l2_dir
     return actor, distributed_actor
 
@@ -931,6 +971,56 @@ class MeasureShardedApiGateTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             actor.measure_sharded(queries=[], k_list=[10])
         self.assertIn("prewarm_partitions", str(cm.exception))
+
+
+class PartitionRoutingFilterTest(unittest.TestCase):
+    """Routing helpers must drop empty/invalid partition ids before search."""
+
+    def test_filter_partition_ids_dedupes_and_intersects_allow_list(self):
+        _, mod = _make_actor_for_validation(l2_dir=None)
+        self.assertEqual(
+            mod._filter_partition_ids([4, 2, 4, 8, 6], {2, 6, 8}),
+            [2, 8, 6],
+        )
+
+    def test_filter_partition_ids_none_allows_all_unique_ids(self):
+        _, mod = _make_actor_for_validation(l2_dir=None)
+        self.assertEqual(mod._filter_partition_ids([1, 1, 2], None), [1, 2])
+
+
+class PartitionIdsByActorTest(unittest.TestCase):
+    """Driver ownership assignment must not reintroduce empty partitions."""
+
+    @staticmethod
+    def _helper():
+        if "ray" not in sys.modules:
+            _stub = types.ModuleType("ray")
+
+            def _remote(*a, **kw):
+                if len(a) == 1 and callable(a[0]):
+                    return a[0]
+                return lambda c: c
+
+            _stub.remote = _remote
+            _stub._private = types.SimpleNamespace(
+                worker=types.SimpleNamespace(_global_node=None)
+            )
+            sys.modules["ray"] = _stub
+        import run_distributed_bench  # noqa: PLC0415
+
+        return run_distributed_bench._partition_ids_by_actor
+
+    def test_assigns_only_supplied_partition_ids_by_modulo(self):
+        helper = self._helper()
+        self.assertEqual(
+            helper([0, 2, 3, 6, 7], 3),
+            [[0, 3, 6], [7], [2]],
+        )
+
+    def test_rejects_zero_actors(self):
+        helper = self._helper()
+        with self.assertRaises(ValueError):
+            helper([0], 0)
 
 
 class AssertL2ValidationCleanTest(unittest.TestCase):
@@ -1284,9 +1374,7 @@ class InvalidateIndexCacheActorTest(unittest.TestCase):
 
     def test_retries_once_on_ioerror(self):
         actor, attempts, _ = self._build_actor(raises=(IOError("rename failed"),))
-        result = actor.invalidate_index_cache(
-            "uri", "vector_idx", retry_sleep_s=0
-        )
+        result = actor.invalidate_index_cache("uri", "vector_idx", retry_sleep_s=0)
         self.assertEqual(len(attempts), 2)
         self.assertEqual(result["attempts"], 2)
         self.assertTrue(result["retried"])
@@ -1328,7 +1416,7 @@ class PctDeltaTest(unittest.TestCase):
     def _helper():
         if "ray" not in sys.modules:
             _stub = types.ModuleType("ray")
-            _stub.remote = lambda *a, **kw: (a[0] if len(a) == 1 else (lambda c: c))
+            _stub.remote = lambda *a, **kw: a[0] if len(a) == 1 else (lambda c: c)
             _stub._private = types.SimpleNamespace(
                 worker=types.SimpleNamespace(_global_node=None)
             )
@@ -1361,7 +1449,7 @@ class SimulateInvalidationCliGuardTest(unittest.TestCase):
     def _module():
         if "ray" not in sys.modules:
             _stub = types.ModuleType("ray")
-            _stub.remote = lambda *a, **kw: (a[0] if len(a) == 1 else (lambda c: c))
+            _stub.remote = lambda *a, **kw: a[0] if len(a) == 1 else (lambda c: c)
             _stub._private = types.SimpleNamespace(
                 worker=types.SimpleNamespace(_global_node=None)
             )
