@@ -250,6 +250,7 @@ tag-mapping.json
 /CLAUDE.md
 /CLAUDE-*.md
 CLAUDE.local.md
+.codex
 
 # Worktrees
 .worktrees/
