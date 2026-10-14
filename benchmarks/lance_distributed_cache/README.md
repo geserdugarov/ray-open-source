@@ -130,11 +130,28 @@ The constructor must show `l1_partition_capacity_bytes`, and prewarm must show
 
 ## Local MinIO run
 
-Start MinIO and create the default bucket:
+If you have an accessible MinIO container image and Docker Compose, start
+MinIO and create the default bucket:
 
 ```bash
 benchmarks/lance_distributed_cache/infra/run_minio.sh up
 ```
+
+The default historical image URLs may be unavailable. A source build avoids
+that dependency and also works on a machine without Docker Compose:
+
+```bash
+bash benchmarks/lance_distributed_cache/infra/start_minio_native.sh
+bash benchmarks/lance_distributed_cache/infra/make_bucket.sh
+```
+
+This pins MinIO to `RELEASE.2025-04-22T22-12-26Z` and needs Go 1.24 or newer.
+`MINIO_BINARY=/absolute/path/to/minio` uses an existing binary, including one
+copied from another machine. Set `MINIO_BIND_ADDR` for the S3 listener and
+`STATE_DIR` for data, log, and PID files. On a remote storage host, create the
+bucket from the benchmark host with `MINIO_URL=http://storage-host:9000`.
+The native server is retained for dataset reuse; stop it using its recorded
+PID after verifying the process. Neither startup script deletes data.
 
 Choose a real local disk for `--nvme-dir`; avoid tmpfs and shared/network
 filesystems. A small functional run is:

@@ -2,18 +2,31 @@
 set -euo pipefail
 
 BUCKET="${BUCKET:-lance-bench}"
-NETWORK="${NETWORK:-lance_distributed_cache_default}"
-MINIO_URL="${MINIO_URL:-http://minio:9000}"
-MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc:latest}"
+MINIO_URL="${MINIO_URL:-http://127.0.0.1:9000}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_PYTHON="${BENCH_PYTHON:-${SCRIPT_DIR}/../.venv/bin/python}"
 
-docker run --rm \
-  --network "${NETWORK}" \
-  --entrypoint sh \
-  -e BUCKET="${BUCKET}" \
-  -e MINIO_URL="${MINIO_URL}" \
-  "${MC_IMAGE}" -c '
-    set -e
-    mc alias set local "${MINIO_URL}" minioadmin minioadmin
-    mc mb --ignore-existing "local/${BUCKET}"
-    mc ls local/
-  '
+BUCKET="${BUCKET}" MINIO_URL="${MINIO_URL}" "${BENCH_PYTHON}" - <<'PY'
+import os
+
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+client = boto3.client(
+    "s3",
+    endpoint_url=os.environ["MINIO_URL"],
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+    region_name="us-east-1",
+    config=Config(s3={"addressing_style": "path"}),
+)
+bucket = os.environ["BUCKET"]
+try:
+    client.head_bucket(Bucket=bucket)
+except ClientError as error:
+    if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+        raise
+    client.create_bucket(Bucket=bucket)
+print(f"MinIO bucket ready: {bucket}")
+PY
