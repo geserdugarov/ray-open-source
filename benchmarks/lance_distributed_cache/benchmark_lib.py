@@ -9,10 +9,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, Sequence
 
-
 MIB = 1024 * 1024
 GIB = 1024 * MIB
-SCENARIOS = ("no-index-cache", "moka", "distributed")
+SCENARIOS = ("no-index-cache", "memory", "distributed")
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,7 @@ class SessionSpec:
     scenario: str
     metadata_capacity_bytes: int
     partition_capacity_bytes: int | None
-    moka_capacity_bytes: int
+    memory_capacity_bytes: int
     l2_dir: str | None = None
 
     def validate(self) -> None:
@@ -74,8 +73,8 @@ class SessionSpec:
                 raise ValueError(
                     "partition_capacity_bytes must be positive or None to disable L1"
                 )
-        if self.moka_capacity_bytes <= 0:
-            raise ValueError("moka_capacity_bytes must be positive")
+        if self.memory_capacity_bytes <= 0:
+            raise ValueError("memory_capacity_bytes must be positive")
         if self.scenario == "distributed":
             if not self.l2_dir:
                 raise ValueError("distributed scenario requires l2_dir")
@@ -109,9 +108,9 @@ def build_session(spec: SessionSpec, lance_module=None):
             index_cache_size_bytes=0,
             metadata_cache_size_bytes=spec.metadata_capacity_bytes,
         )
-    if spec.scenario == "moka":
+    if spec.scenario == "memory":
         return lance_module.Session(
-            index_cache_size_bytes=spec.moka_capacity_bytes,
+            index_cache_size_bytes=spec.memory_capacity_bytes,
             metadata_cache_size_bytes=spec.metadata_capacity_bytes,
         )
     return lance_module.Session.with_distributed_cache(
@@ -326,6 +325,10 @@ def aggregate_phase(
                 "session_size_bytes": sum(
                     int(result.get("session_size_bytes", 0)) for result in actor_results
                 ),
+                "index_cache_weight_bytes": sum(
+                    int(result.get("index_cache_weight_bytes", 0))
+                    for result in actor_results
+                ),
                 "l2_cache_entry_count": sum(
                     int((result.get("l2_snapshot") or {}).get("cache_entry_count", 0))
                     for result in actor_results
@@ -334,6 +337,39 @@ def aggregate_phase(
                     int((result.get("l2_snapshot") or {}).get("apparent_bytes", 0))
                     for result in actor_results
                 ),
+                "source_read_bytes": sum(
+                    int(result.get("source_read_bytes", 0)) for result in actor_results
+                ),
+                "source_read_iops": sum(
+                    int(result.get("source_read_iops", 0)) for result in actor_results
+                ),
+                "process_disk_read_bytes": (
+                    sum(
+                        int(result["process_disk_read_bytes"])
+                        for result in actor_results
+                    )
+                    if all(
+                        result.get("process_disk_read_bytes") is not None
+                        for result in actor_results
+                    )
+                    else None
+                ),
             }
         )
     return rows
+
+
+def validate_result_digests(events: Sequence[Dict[str, Any]]) -> None:
+    """Require identical ordered row IDs for each actor and k across all passes."""
+    expected: Dict[tuple[int, str], str] = {}
+    for event in events:
+        if event.get("event") != "measure":
+            continue
+        for k, digest in event["row_ids_sha256_by_k"].items():
+            key = (event["actor_id"], k)
+            if key in expected and expected[key] != digest:
+                raise RuntimeError(
+                    f"query results differ for actor={key[0]}, k={k}, "
+                    f"scenario={event['scenario']}, phase={event['phase']}"
+                )
+            expected[key] = digest

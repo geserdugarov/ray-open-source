@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import inspect
 import json
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,7 +19,6 @@ from pathlib import Path
 from typing import Any, Dict, Sequence
 
 import numpy as np
-
 from benchmark_lib import (
     MIB,
     SCENARIOS,
@@ -31,6 +32,7 @@ from benchmark_lib import (
     parse_int_list,
     parse_partition_selection,
     resolve_index_addresses,
+    validate_result_digests,
 )
 from cache_inspect import (
     diff_snapshots,
@@ -39,7 +41,6 @@ from cache_inspect import (
     invalidation_errors,
     snapshot_l2_dir,
 )
-
 
 HERE = Path(__file__).resolve().parent
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -75,6 +76,7 @@ class CacheWorker:
         nprobes: int,
     ):
         import lance
+
         import ray
 
         self.actor_id = int(actor_id)
@@ -99,19 +101,41 @@ class CacheWorker:
             return None
         return _compact_snapshot(snapshot_l2_dir(self.l2_dir))
 
+    @staticmethod
+    def _disk_read_bytes() -> int | None:
+        try:
+            fields = dict(
+                line.split(":", 1)
+                for line in Path("/proc/self/io").read_text().splitlines()
+            )
+        except OSError:
+            return None
+        return int(fields["read_bytes"])
+
     def info(self, index_name: str) -> Dict[str, Any]:
         return {
             "actor_id": self.actor_id,
             "node_id": self.node_id,
             "pid": os.getpid(),
+            "hostname": socket.gethostname(),
             "lance_version": self.lance_version,
+            "thread_environment": {
+                key: os.environ.get(key)
+                for key in (
+                    "LANCE_CPU_THREADS",
+                    "LANCE_IO_THREADS",
+                    "OMP_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                )
+            },
             "index_addresses": resolve_index_addresses(self.dataset, index_name),
             "session_size_bytes": int(self.session.size_bytes()),
             "l2_snapshot": self._snapshot(),
         }
 
-    def _run_query(self, query: np.ndarray, k: int) -> int:
-        table = self.dataset.to_table(
+    def _run_query(self, query: np.ndarray, k: int):
+        return self.dataset.to_table(
             columns=["_distance"],
             with_row_id=True,
             nearest={
@@ -121,7 +145,6 @@ class CacheWorker:
                 "nprobes": self.nprobes,
             },
         )
-        return int(table.num_rows)
 
     def prewarm(
         self,
@@ -132,6 +155,7 @@ class CacheWorker:
         warmup_k: int,
     ) -> Dict[str, Any]:
         before = self._snapshot()
+        io_before = self.dataset.io_stats_snapshot()
         size_before = int(self.session.size_bytes())
         started = time.perf_counter()
         if mode == "strict":
@@ -144,6 +168,8 @@ class CacheWorker:
         elif mode != "none":
             raise ValueError(f"unknown prewarm mode: {mode!r}")
         duration_s = time.perf_counter() - started
+        io_after = self.dataset.io_stats_snapshot()
+        index_cache_weight_bytes = int(self.session.index_cache_size_bytes())
         after = self._snapshot()
         return {
             "event": "prewarm",
@@ -151,8 +177,11 @@ class CacheWorker:
             "mode": mode,
             "partition_selection": "all" if not partition_ids else partition_ids,
             "duration_s": duration_s,
+            "source_read_bytes": int(io_after.read_bytes - io_before.read_bytes),
+            "source_read_iops": int(io_after.read_iops - io_before.read_iops),
             "session_size_bytes_before": size_before,
             "session_size_bytes_after": int(self.session.size_bytes()),
+            "index_cache_weight_bytes": index_cache_weight_bytes,
             "l2_before": before,
             "l2_after": after,
             "l2_delta": diff_snapshots(before, after) if before and after else None,
@@ -166,21 +195,57 @@ class CacheWorker:
     ) -> Dict[str, Any]:
         latencies: Dict[str, list[float]] = {str(k): [] for k in k_values}
         returned_rows: Dict[str, int] = {str(k): 0 for k in k_values}
+        row_ids_digests = {str(k): hashlib.sha256() for k in k_values}
+        io_before = self.dataset.io_stats_snapshot()
+        disk_before = self._disk_read_bytes()
         started = time.perf_counter()
         for query in queries:
             for k in k_values:
                 query_started = time.perf_counter()
-                returned_rows[str(k)] += self._run_query(query, k)
+                table = self._run_query(query, k)
                 latencies[str(k)].append(time.perf_counter() - query_started)
+                if table.num_rows != k:
+                    raise RuntimeError(
+                        f"actor={self.actor_id}, k={k}: returned {table.num_rows} rows"
+                    )
+                distances = table["_distance"].to_numpy()
+                if not np.all(np.isfinite(distances)):
+                    raise RuntimeError(
+                        f"actor={self.actor_id}, k={k}: non-finite distance"
+                    )
+                # Keep validation outside each query's latency measurement.
+                row_ids = table["_rowid"].to_numpy().astype("<u8", copy=False)
+                row_ids_digests[str(k)].update(row_ids.tobytes())
+                returned_rows[str(k)] += table.num_rows
         duration_s = time.perf_counter() - started
+        io_after = self.dataset.io_stats_snapshot()
+        disk_after = self._disk_read_bytes()
         return {
             "event": "measure",
             "actor_id": self.actor_id,
             "phase": phase,
             "latencies_by_k": latencies,
             "returned_rows_by_k": returned_rows,
+            "row_ids_sha256_by_k": {
+                k: digest.hexdigest() for k, digest in row_ids_digests.items()
+            },
             "duration_s": duration_s,
+            "source_read_bytes": int(io_after.read_bytes - io_before.read_bytes),
+            "source_read_iops": int(io_after.read_iops - io_before.read_iops),
+            "process_disk_read_bytes": (
+                disk_after - disk_before
+                if disk_after is not None and disk_before is not None
+                else None
+            ),
+        }
+
+    def measurement_stats(self) -> Dict[str, Any]:
+        # Moka maintenance and directory scans can dominate a short cached pass.
+        # Collect them in a separate RPC after the driver stops its timer.
+        index_cache_weight_bytes = int(self.session.index_cache_size_bytes())
+        return {
             "session_size_bytes": int(self.session.size_bytes()),
+            "index_cache_weight_bytes": index_cache_weight_bytes,
             "l2_snapshot": self._snapshot(),
         }
 
@@ -208,12 +273,25 @@ class CacheWorker:
             "l2_delta": diff_snapshots(before, after) if before and after else None,
         }
 
-    def close(self) -> Dict[str, Any]:
+    def close(self, drop_l2_file_pages: bool = False) -> Dict[str, Any]:
         snapshot = self._snapshot()
         self.dataset = None
         self.session = None
         gc.collect()
-        return {"actor_id": self.actor_id, "l2_snapshot": snapshot}
+        advised_files = 0
+        advised_bytes = 0
+        if drop_l2_file_pages and self.l2_dir is not None:
+            for entry in snapshot_l2_dir(self.l2_dir)["files"]:
+                with (Path(self.l2_dir) / entry["name"]).open("rb") as stream:
+                    os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                advised_files += 1
+                advised_bytes += entry["apparent_bytes"]
+        return {
+            "actor_id": self.actor_id,
+            "l2_snapshot": snapshot,
+            "l2_page_cache_advised_files": advised_files,
+            "l2_page_cache_advised_bytes": advised_bytes,
+        }
 
 
 def _nonnegative_int(value: str) -> int:
@@ -265,10 +343,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Decoded-partition L1 capacity; 0 disables this tier.",
     )
     parser.add_argument(
-        "--moka-mb",
+        "--memory-mb",
         type=_positive_int,
         default=None,
-        help="Moka index-cache capacity. Defaults to metadata + partition L1.",
+        help="Default QuickCache index capacity. Defaults to metadata + partition L1.",
     )
     parser.add_argument("--nvme-dir", default="/mnt/nvme/lance-cache-bench")
     parser.add_argument("--l2-run-id", default=None)
@@ -294,8 +372,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Recreate actors on the same nodes and measure the persistent L2.",
     )
     parser.add_argument("--invalidation-drill", action="store_true")
+    parser.add_argument(
+        "--drop-l2-page-cache-on-restart",
+        action="store_true",
+        help="Advise eviction of this run's persisted L2 file pages before restart.",
+    )
     parser.add_argument("--lance-cpu-threads", type=_positive_int, default=None)
     parser.add_argument("--lance-io-threads", type=_positive_int, default=None)
+    parser.add_argument(
+        "--lance-build-commit", default=os.environ.get("LANCE_BUILD_COMMIT")
+    )
     parser.add_argument("--out-dir", default=str(HERE / "out"))
     return parser.parse_args(argv)
 
@@ -329,12 +415,23 @@ def _validate_args(args: argparse.Namespace) -> tuple[list[str], list[int], list
         raise ValueError("--prewarm-partitions contains an out-of-range ID")
     if args.cpus_per_actor <= 0:
         raise ValueError("--cpus-per-actor must be positive")
+    if args.measure_queries < args.num_actors:
+        raise ValueError("--measure-queries must be at least --num-actors")
+    if max(k_values) > args.scale:
+        raise ValueError("--k-list must not exceed --scale")
     if args.prewarm != "strict" and args.prewarm_partitions != "all":
         raise ValueError(
             "--prewarm-partitions is only meaningful with --prewarm strict"
         )
     if args.invalidation_drill and not args.measure_restart:
         raise ValueError("--invalidation-drill requires --measure-restart")
+    if args.drop_l2_page_cache_on_restart:
+        if not args.measure_restart:
+            raise ValueError(
+                "--drop-l2-page-cache-on-restart requires --measure-restart"
+            )
+        if not hasattr(os, "posix_fadvise"):
+            raise ValueError("--drop-l2-page-cache-on-restart requires posix_fadvise")
     if args.l2_run_id is not None and not _RUN_ID_RE.fullmatch(args.l2_run_id):
         raise ValueError(
             "--l2-run-id may contain only letters, digits, '.', '_' and '-'"
@@ -379,9 +476,9 @@ def _session_spec(
 ) -> SessionSpec:
     metadata_bytes = int(args.metadata_l1_mb) * MIB
     partition_bytes = int(args.partition_l1_mb) * MIB if args.partition_l1_mb else None
-    moka_bytes = (
-        int(args.moka_mb) * MIB
-        if args.moka_mb is not None
+    memory_bytes = (
+        int(args.memory_mb) * MIB
+        if args.memory_mb is not None
         else metadata_bytes + (partition_bytes or 0)
     )
     l2_dir = None
@@ -393,7 +490,7 @@ def _session_spec(
         scenario=scenario,
         metadata_capacity_bytes=metadata_bytes,
         partition_capacity_bytes=partition_bytes,
-        moka_capacity_bytes=moka_bytes,
+        memory_capacity_bytes=memory_bytes,
         l2_dir=l2_dir,
     )
 
@@ -438,10 +535,13 @@ def _spawn_actors(
     return actors
 
 
-def _close_actors(ray_module, actors) -> None:
-    ray_module.get([actor.close.remote() for actor in actors])
+def _close_actors(ray_module, actors, *, drop_l2_file_pages: bool = False):
+    results = ray_module.get(
+        [actor.close.remote(drop_l2_file_pages) for actor in actors]
+    )
     for actor in actors:
         ray_module.kill(actor)
+    return results
 
 
 def _measure_phase(
@@ -453,22 +553,34 @@ def _measure_phase(
     query_chunks: Sequence[np.ndarray],
     k_values: list[int],
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-    started = time.perf_counter()
-    actor_results = ray_module.get(
-        [
-            actor.measure.remote(phase, query_chunks[index], k_values)
-            for index, actor in enumerate(actors)
-        ]
-    )
-    wall_time_s = time.perf_counter() - started
-    rows = aggregate_phase(
-        scenario=scenario,
-        phase=phase,
-        actor_results=actor_results,
-        k_values=k_values,
-        wall_time_s=wall_time_s,
-    )
-    return actor_results, rows
+    all_results = []
+    all_rows = []
+    # Each k needs its own concurrent pass and wall time for meaningful QPS.
+    for k in k_values:
+        started = time.perf_counter()
+        actor_results = ray_module.get(
+            [
+                actor.measure.remote(phase, query_chunks[index], [k])
+                for index, actor in enumerate(actors)
+            ]
+        )
+        wall_time_s = time.perf_counter() - started
+        snapshots = ray_module.get(
+            [actor.measurement_stats.remote() for actor in actors]
+        )
+        for result, snapshot in zip(actor_results, snapshots):
+            result.update(snapshot)
+        all_results.extend(actor_results)
+        all_rows.extend(
+            aggregate_phase(
+                scenario=scenario,
+                phase=phase,
+                actor_results=actor_results,
+                k_values=[k],
+                wall_time_s=wall_time_s,
+            )
+        )
+    return all_results, all_rows
 
 
 def _print_rows(rows: Sequence[Dict[str, Any]]) -> None:
@@ -479,8 +591,9 @@ def _print_rows(rows: Sequence[Dict[str, Any]]) -> None:
             f"p95={row['p95_s'] * 1000:8.2f} ms "
             f"p99={row['p99_s'] * 1000:8.2f} ms "
             f"throughput={row['throughput_qps']:8.2f} q/s "
-            f"L1={format_bytes(row['session_size_bytes'])} "
-            f"L2={format_bytes(row['l2_apparent_bytes'])}"
+            f"index_L1_weight={format_bytes(row['index_cache_weight_bytes'])} "
+            f"L2={format_bytes(row['l2_apparent_bytes'])} "
+            f"source={format_bytes(row['source_read_bytes'])}"
         )
 
 
@@ -542,6 +655,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
         "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
         "AWS_ALLOW_HTTP": "true",
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
     }
     if args.lance_cpu_threads is not None:
         worker_env["LANCE_CPU_THREADS"] = str(args.lance_cpu_threads)
@@ -551,7 +667,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ray.init(
         address=args.ray_address,
-        runtime_env={"working_dir": str(HERE), "env_vars": worker_env},
+        runtime_env={
+            "working_dir": str(HERE),
+            "env_vars": worker_env,
+            "excludes": [".venv/", "out/", "results/", "__pycache__/"],
+        },
         ignore_reinit_error=True,
     )
 
@@ -669,7 +789,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _close_actors(ray, actors)
                 continue
 
-            _close_actors(ray, actors)
+            close_results = _close_actors(
+                ray,
+                actors,
+                drop_l2_file_pages=args.drop_l2_page_cache_on_restart,
+            )
+            events.extend(
+                {"scenario": scenario, "event": "actor_close_before_restart", **item}
+                for item in close_results
+            )
             actors = _spawn_actors(
                 ray_module=ray,
                 remote_worker=remote_worker,
@@ -779,8 +907,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "lance": lance.__version__,
             "numpy": np.__version__,
             "pyarrow": pyarrow.__version__,
+            "python": sys.version,
+        },
+        "worker_environment": {
+            key: value
+            for key, value in worker_env.items()
+            if not key.startswith("AWS_")
         },
         "lance_target_commits": TARGET_LANCE_COMMITS,
+        "lance_build_commit": args.lance_build_commit,
         "lance_api": {
             "Session.with_distributed_cache": str(
                 inspect.signature(lance.Session.with_distributed_cache)
@@ -794,6 +929,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     }
     _write_outputs(output_dir, config, events, summary_rows)
+    validate_result_digests(events)
+    print("Query row IDs match across all scenarios and phases.")
     print(f"\nWrote {output_dir / 'run.json'}")
     print(f"Wrote {output_dir / 'events.jsonl'}")
     print(f"Wrote {output_dir / 'summary.csv'}")

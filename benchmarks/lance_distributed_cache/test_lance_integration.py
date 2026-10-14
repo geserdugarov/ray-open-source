@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 try:
     import lance
     import numpy as np
@@ -95,7 +94,7 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
                 name="vector_idx",
                 index_type="IVF_RQ",
                 num_partitions=4,
-                num_bits=2,
+                num_bits=8,
             )
             del dataset
 
@@ -134,7 +133,21 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
                     "nprobes": 4,
                 },
             )
-            self.assertGreater(result.num_rows, 0)
+            self.assertEqual(result.num_rows, 10)
+            exact_ids = np.argsort(np.sum((vectors - vectors[0]) ** 2, axis=1))[:10]
+            returned_ids = result["id"].to_numpy()
+            recall = len(set(exact_ids) & set(returned_ids)) / 10
+            self.assertGreaterEqual(recall, 0.5)
+            uncached = lance.dataset(
+                dataset_uri, session=lance.Session(index_cache_size_bytes=0)
+            ).to_table(
+                columns=["id", "_distance"],
+                nearest={"column": "vector", "q": vectors[0], "k": 10, "nprobes": 4},
+            )
+            np.testing.assert_array_equal(returned_ids, uncached["id"].to_numpy())
+            np.testing.assert_allclose(
+                result["_distance"].to_numpy(), uncached["_distance"].to_numpy()
+            )
 
             index_address = str(restarted.describe_indices()[0].segments[0].uuid)
             restarted_session.invalidate_index_cache(restarted.uri, index_address)

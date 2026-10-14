@@ -10,7 +10,7 @@ the same deterministic query vectors:
 | Scenario | Lance session | Durable across actor restart |
 |---|---|---|
 | `no-index-cache` | `Session(index_cache_size_bytes=0)` | No |
-| `moka` | byte-sized in-memory index cache | No |
+| `memory` | default byte-sized QuickCache index cache | No |
 | `distributed` | metadata L1, optional decoded-partition L1, local-file L2 | Yes |
 
 Each actor owns a distinct L2 directory. Ray controls process and node
@@ -48,8 +48,8 @@ The implementation and its documentation establish these benchmark contracts:
   partition ID from an opaque filename.
 - The Rust backend has L2 counters, but commit `bf6fa8d75` does not expose them
   through Python. Python exposes `Session.size_bytes()` for the in-memory
-  footprint, so latency plus read-only filesystem snapshots are the available
-  external signals.
+  footprint and `dataset.io_stats_snapshot()` for source reads. The benchmark
+  records source byte/operation deltas plus read-only L2 filesystem snapshots.
 - That commit does not expose Python `compute_partition_ids` or
   `search_partitions` methods. This benchmark consequently measures ordinary
   full Lance queries in replicated actors. It does not pretend to benchmark a
@@ -76,8 +76,18 @@ same query set:
    tombstones, strictly prewarm again, and repeat the measurement.
 
 The summary includes per-query p50/p95/p99/mean latency, aggregate throughput,
-summed `Session.size_bytes()`, and aggregate live L2 bytes and entry count.
-Raw actor events preserve prewarm, restart, and invalidation timings.
+summed index-cache eviction weights, `Session.size_bytes()` estimates, and
+aggregate live L2 bytes and entry count. Statistics collection and L2 directory
+scans run in separate actor calls after the throughput timer stops. Cache
+maintenance is drained after prewarm and each pass, outside those timers.
+On Linux, `/proc/self/io` supplies per-actor physical disk-read byte deltas;
+these describe all local reads by that actor, not an L2-specific hit counter.
+Raw actor events preserve prewarm, restart, and invalidation timings. Each `k`
+is timed as a separate concurrent pass, so its throughput excludes other `k`
+values. Later `k` values can reuse partitions loaded by earlier passes.
+Ordered result row IDs must match across all scenarios and phases; validation
+runs after each query's latency timer. Actor and driver wall times include that
+validation work.
 
 ## Environment
 
@@ -165,6 +175,10 @@ Useful variants:
 # Strictly persist a known subset (all is encoded as an empty Python list).
 .../run_benchmark.py --prewarm strict --prewarm-partitions 0,17,42 ...
 
+# Advise eviction of this run's L2 file pages after closing sessions, before
+# restarting actors. Inspect process_disk_read_bytes to confirm physical IO.
+.../run_benchmark.py --drop-l2-page-cache-on-restart ...
+
 # Reattach to an intentionally retained L2 run directory.
 .../run_benchmark.py --l2-run-id known-warm-run --skip-setup ...
 ```
@@ -208,15 +222,24 @@ Use `plot_results.py <summary.csv>` to create latency and throughput plots.
 ## Interpreting results
 
 - Compare `process_restart` across scenarios to isolate the benefit of
-  persistent L2. Moka and disabled-cache actors restart cold; distributed
+  persistent L2. Memory and disabled-cache actors restart cold; distributed
   actors retain opaque partition files.
 - Compare `initial` with `l1_warm` to see decoded in-process reuse.
+- The default `memory` scenario uses QuickCache for both index and file
+  metadata. The distributed backend uses separate Moka metadata/partition
+  tiers, plus the same QuickCache file metadata tier. Equal total capacities
+  therefore compare the public session configurations, including their
+  admission policies. `--memory-mb` overrides the baseline index budget.
 - With `--partition-l1-mb 0`, a distributed restart and every subsequent miss
   decode from L2, which isolates local-file behavior from decoded L1.
 - Strict-prewarm duration is an end-to-end persistence measurement. A second
   strict prewarm on an existing L2 validates and skips valid entries, so its
   timing is not comparable to first population.
 - `Session.size_bytes()` is not an L2 size and is not a hit ratio.
+- `Session.size_bytes()` walks object allocations and can overestimate shared
+  Arrow IPC buffers. It is not RSS. `index_cache_weight_bytes` reports the
+  index backend's eviction weights after pending maintenance has completed;
+  use the configured quotas and this weight for cache-budget comparisons.
 - MinIO on the same host, Linux page cache, CPU oversubscription, and an NVMe
   shared by several actors can dominate results. Report topology, thread
   settings, storage placement, and the full `run.json` with measurements.
@@ -226,7 +249,7 @@ Use `plot_results.py <summary.csv>` to create latency and throughput plots.
 The fast tests use stubs and synthetic cache directories:
 
 ```bash
-python/venv/bin/python -m unittest discover \
+benchmarks/lance_distributed_cache/.venv/bin/python -m unittest discover \
   -s benchmarks/lance_distributed_cache -p 'test_*.py' -v
 ```
 
