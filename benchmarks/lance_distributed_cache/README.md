@@ -236,6 +236,38 @@ Each run writes `<out-dir>/<run-id>/`:
 
 Use `plot_results.py <summary.csv>` to create latency and throughput plots.
 
+For three repeated trials at small, full-index, and disabled partition L1
+capacities, with scenario order rotated between trials:
+
+```bash
+ENDPOINT_URL=http://storage-host:9000 \
+NVME_DIR=/local/nvme/lance-cache \
+LANCE_BUILD_COMMIT=$(git -C ../lance-open-source rev-parse HEAD) \
+  bash benchmarks/lance_distributed_cache/run_comparison.sh
+
+benchmarks/lance_distributed_cache/.venv/bin/python \
+  benchmarks/lance_distributed_cache/analyze_comparison.py \
+  benchmarks/lance_distributed_cache/out/<comparison-id> \
+  --out-dir benchmarks/lance_distributed_cache/results/<comparison-id>
+```
+
+The comparison runner defaults to 1 million 256-dimensional vectors, 512
+partitions, `k=10`, 16 probes, and 256 queries per phase split among four
+actors. The memory-only index budget equals the distributed metadata plus
+partition L1 budgets. `REPETITIONS`, `SCALE`, `DIM`, `NUM_PARTITIONS`,
+`NPROBES`, and `MEASURE_QUERIES` override the workload. It performs one
+invalidation drill and records explicit CPU, IO, and BLAS thread limits.
+
+The analyzer verifies new actor PIDs, unchanged node placement, persisted L2
+entries, invalidation, and matching query results across runs. It writes pooled
+latency percentiles, median and range of trial throughput, source IO totals,
+first-query latency after restart, CSVs, and PNG/SVG throughput plots. These
+trial ranges describe observed variability, not confidence intervals.
+Analyze runs with and without explicit page eviction in separate input directories. Page
+eviction uses `POSIX_FADV_DONTNEED` on persisted entry files in each actor's
+dedicated directory; it is advisory, so physical read counters provide the
+evidence that subsequent reads reached disk.
+
 ## Interpreting results
 
 - Compare `process_restart` across scenarios to isolate the benefit of
