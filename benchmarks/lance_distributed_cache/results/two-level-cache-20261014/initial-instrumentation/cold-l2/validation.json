@@ -1,0 +1,11 @@
+{
+  "runs": [
+    "perf-cold-20261014-small-1",
+    "perf-cold-20261014-small-2",
+    "perf-cold-20261014-small-3"
+  ],
+  "restarted_actors": 24,
+  "invalidated_actors": 0,
+  "matching_query_results": true,
+  "measured_queries": 4608
+}

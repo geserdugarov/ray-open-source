@@ -1,0 +1,7 @@
+MinIO ready at http://192.168.201.98:9000 (PID 636258)
+Create a bucket with MINIO_URL=http://192.168.201.98:9000 infra/make_bucket.sh
+minio version DEVELOPMENT.GOGET (commit-id=DEVELOPMENT.GOGET)
+Runtime: go1.27.0 linux/amd64
+License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
+Copyright: 2015-0000 MinIO, Inc.
+09331fc7223602eb6f72961826d92f8c26c6f69e46015d9e65aa3298333d7db5  /home/d00838679/lance-two-level-benchmark/bin/minio

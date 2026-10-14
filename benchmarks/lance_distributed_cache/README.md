@@ -268,6 +268,13 @@ eviction uses `POSIX_FADV_DONTNEED` on persisted entry files in each actor's
 dedicated directory; it is advisory, so physical read counters provide the
 evidence that subsequent reads reached disk.
 
+## Measured comparison
+
+The [October 14, 2026 report](results/two-level-cache-20261014/report.md) compares
+three cache capacities over three trials, plus three trials with explicit file-page
+eviction before restart. It includes raw actor events, exact build information,
+source IO, cache footprints, validation, and throughput plots.
+
 ## Interpreting results
 
 - Compare `process_restart` across scenarios to isolate the benefit of

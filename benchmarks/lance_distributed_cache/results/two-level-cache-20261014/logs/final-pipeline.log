@@ -1,0 +1,77 @@
+Running perf-final-20261014-small-1
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/summary.csv
+Running perf-final-20261014-fit-1
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-1/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-1/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-1/summary.csv
+Running perf-final-20261014-l2-only-1
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-1/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-1/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-1/summary.csv
+Running perf-final-20261014-small-2
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-2/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-2/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-2/summary.csv
+Running perf-final-20261014-fit-2
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-2/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-2/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-2/summary.csv
+Running perf-final-20261014-l2-only-2
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-2/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-2/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-2/summary.csv
+Running perf-final-20261014-small-3
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-3/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-3/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-3/summary.csv
+Running perf-final-20261014-fit-3
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-3/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-3/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-fit-3/summary.csv
+Running perf-final-20261014-l2-only-3
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-3/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-3/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-l2-only-3/summary.csv
+Comparison results: /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014
+{
+  "runs": [
+    "perf-final-20261014-fit-1",
+    "perf-final-20261014-fit-2",
+    "perf-final-20261014-fit-3",
+    "perf-final-20261014-l2-only-1",
+    "perf-final-20261014-l2-only-2",
+    "perf-final-20261014-l2-only-3",
+    "perf-final-20261014-small-1",
+    "perf-final-20261014-small-2",
+    "perf-final-20261014-small-3"
+  ],
+  "restarted_actors": 84,
+  "invalidated_actors": 4,
+  "matching_query_results": true,
+  "measured_queries": 16384
+}
+Wrote comparison to /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/results/two-level-cache-20261014
+{
+  "runs": [
+    "perf-final-cold-20261014-small-1",
+    "perf-final-cold-20261014-small-2",
+    "perf-final-cold-20261014-small-3"
+  ],
+  "restarted_actors": 24,
+  "invalidated_actors": 0,
+  "matching_query_results": true,
+  "measured_queries": 4608
+}
+Wrote comparison to /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/results/two-level-cache-20261014/cold-l2
+Final performance comparisons and analysis complete.

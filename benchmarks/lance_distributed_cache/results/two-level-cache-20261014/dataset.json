@@ -1,0 +1,19 @@
+{
+  "uri": "s3://lance-bench/ivf_rq_def2414a8c5d/",
+  "dataset_spec": {
+    "scale": 1000000,
+    "dimension": 256,
+    "num_partitions": 512,
+    "num_bits": 8,
+    "seed": 42,
+    "index_name": "vector_idx"
+  },
+  "rows": 1000000,
+  "version": 2,
+  "fragments": 1,
+  "index_addresses": [
+    "bdece810-56cb-4bdd-a943-bfa3193b0a85"
+  ],
+  "schema": "vector: fixed_size_list<item: float>[256]\n  child 0, item: float",
+  "setup_build_profile": "release (setup only)"
+}

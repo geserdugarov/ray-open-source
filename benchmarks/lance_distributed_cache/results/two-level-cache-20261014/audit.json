@@ -1,0 +1,28 @@
+{
+  "runs": [
+    "perf-final-20261014-fit-1",
+    "perf-final-20261014-fit-2",
+    "perf-final-20261014-fit-3",
+    "perf-final-20261014-l2-only-1",
+    "perf-final-20261014-l2-only-2",
+    "perf-final-20261014-l2-only-3",
+    "perf-final-20261014-small-1",
+    "perf-final-20261014-small-2",
+    "perf-final-20261014-small-3",
+    "perf-final-cold-20261014-small-1",
+    "perf-final-cold-20261014-small-2",
+    "perf-final-cold-20261014-small-3"
+  ],
+  "measured_queries": 20992,
+  "restarted_actors": 108,
+  "invalidated_actors": 4,
+  "matching_query_results_across_all_runs": true,
+  "same_dataset_index_uuid": true,
+  "new_pids_on_same_nodes": true,
+  "cache_eviction_weights_within_configured_budgets": true,
+  "persisted_entries_per_actor": 512,
+  "persisted_bytes_per_actor": 318560384,
+  "cold_restart_actors_with_physical_reads": 12,
+  "cold_restart_actor_physical_read_bytes_min": 272642048,
+  "cold_restart_actor_physical_read_bytes_max": 280215552
+}

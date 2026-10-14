@@ -1,0 +1,17 @@
+{
+  "runs": [
+    "perf-20261014-fit-1",
+    "perf-20261014-fit-2",
+    "perf-20261014-fit-3",
+    "perf-20261014-l2-only-1",
+    "perf-20261014-l2-only-2",
+    "perf-20261014-l2-only-3",
+    "perf-20261014-small-1",
+    "perf-20261014-small-2",
+    "perf-20261014-small-3"
+  ],
+  "restarted_actors": 84,
+  "invalidated_actors": 4,
+  "matching_query_results": true,
+  "measured_queries": 16384
+}

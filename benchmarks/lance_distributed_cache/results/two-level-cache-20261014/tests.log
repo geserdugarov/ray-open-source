@@ -1,0 +1,39 @@
+test_aggregates_actor_latencies_and_cache_sizes (test_benchmark.AggregatePhaseTest.test_aggregates_actor_latencies_and_cache_sizes) ... ok
+test_each_k_has_an_independent_wall_time (test_benchmark.AggregatePhaseTest.test_each_k_has_an_independent_wall_time) ... ok
+test_distributed_can_disable_partition_l1 (test_benchmark.BuildSessionTest.test_distributed_can_disable_partition_l1) ... ok
+test_distributed_uses_lance_12_keyword (test_benchmark.BuildSessionTest.test_distributed_uses_lance_12_keyword) ... ok
+test_memory (test_benchmark.BuildSessionTest.test_memory) ... ok
+test_no_index_cache (test_benchmark.BuildSessionTest.test_no_index_cache) ... ok
+test_hash_changes_with_index_shape (test_benchmark.DatasetSpecTest.test_hash_changes_with_index_shape) ... ok
+test_ivf_rq_dimension_validation (test_benchmark.DatasetSpecTest.test_ivf_rq_dimension_validation) ... ok
+test_accepts_requested_surface (test_benchmark.LanceApiValidationTest.test_accepts_requested_surface) ... ok
+test_rejects_old_partition_l1_keyword (test_benchmark.LanceApiValidationTest.test_rejects_old_partition_l1_keyword) ... ok
+test_cli_defaults_exercise_strict_prewarm_and_restart (test_benchmark.ParsingTest.test_cli_defaults_exercise_strict_prewarm_and_restart) ... ok
+test_cli_rejects_empty_actor_work_and_excessive_k (test_benchmark.ParsingTest.test_cli_rejects_empty_actor_work_and_excessive_k) ... ok
+test_cli_rejects_partition_list_without_strict_mode (test_benchmark.ParsingTest.test_cli_rejects_partition_list_without_strict_mode) ... ok
+test_invalidation_drill_requires_restart_phase (test_benchmark.ParsingTest.test_invalidation_drill_requires_restart_phase) ... ok
+test_page_eviction_requires_restart_phase (test_benchmark.ParsingTest.test_page_eviction_requires_restart_phase) ... ok
+test_partition_selection (test_benchmark.ParsingTest.test_partition_selection) ... ok
+test_positive_integer_list (test_benchmark.ParsingTest.test_positive_integer_list) ... ok
+test_missing_index_fails_closed (test_benchmark.ResolveIndexAddressesTest.test_missing_index_fails_closed) ... ok
+test_returns_every_physical_segment (test_benchmark.ResolveIndexAddressesTest.test_returns_every_physical_segment) ... ok
+test_checks_every_actor_k_and_phase (test_benchmark.ResultValidationTest.test_checks_every_actor_k_and_phase) ... ok
+test_builds_unique_per_actor_paths (test_benchmark.SessionSpecFromArgsTest.test_builds_unique_per_actor_paths) ... ok
+test_disk_counter_and_unavailable_platform (test_benchmark.WorkerDiskIoTest.test_disk_counter_and_unavailable_platform) ... ok
+test_evicts_only_persisted_entries_after_releasing_session (test_benchmark.WorkerDiskIoTest.test_evicts_only_persisted_entries_after_releasing_session) ... ok
+test_diff (test_cache_inspect.SnapshotHelpersTest.test_diff) ... ok
+test_invalidation_reports_unsafe_state (test_cache_inspect.SnapshotHelpersTest.test_invalidation_reports_unsafe_state) ... ok
+test_successful_invalidation_allows_empty_tombstone_file (test_cache_inspect.SnapshotHelpersTest.test_successful_invalidation_allows_empty_tombstone_file) ... ok
+test_counts_persistent_tombstones_not_file_presence (test_cache_inspect.SnapshotL2DirTest.test_counts_persistent_tombstones_not_file_presence) ... ok
+test_deleting_namespaces_are_not_live_entries (test_cache_inspect.SnapshotL2DirTest.test_deleting_namespaces_are_not_live_entries) ... ok
+test_does_not_infer_partition_ids_or_count_invalid_names (test_cache_inspect.SnapshotL2DirTest.test_does_not_infer_partition_ids_or_count_invalid_names) ... ok
+test_missing_directory (test_cache_inspect.SnapshotL2DirTest.test_missing_directory) ... ok
+test_reads_lance_12_opaque_layout (test_cache_inspect.SnapshotL2DirTest.test_reads_lance_12_opaque_layout) ... ok
+test_reports_unexpected_version_level_files (test_cache_inspect.SnapshotL2DirTest.test_reports_unexpected_version_level_files) ... ok
+test_dataset_setup_is_idempotent_and_validates_shape (test_lance_integration.LanceDistributedCacheIntegrationTest.test_dataset_setup_is_idempotent_and_validates_shape) ... ok
+test_strict_prewarm_restart_query_and_invalidate (test_lance_integration.LanceDistributedCacheIntegrationTest.test_strict_prewarm_restart_query_and_invalidate) ... ok
+
+----------------------------------------------------------------------
+Ran 34 tests in 0.149s
+
+OK

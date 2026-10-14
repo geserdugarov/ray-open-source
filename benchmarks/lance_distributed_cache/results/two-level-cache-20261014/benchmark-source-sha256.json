@@ -1,0 +1,19 @@
+{
+  "README.md": "b501772bd2a63e050ca4f2e5ac00433095c34c643aa225ea6890f183536036bc",
+  "analyze_comparison.py": "54a5041c450526dfdb25bbd5ba3036d7485662fbda59f23020db4e96ade19324",
+  "benchmark_lib.py": "6b0568f9caf7822f1c16138d6e6882667fb03c8c9061446c1273f6a8d1f1fa6d",
+  "cache_inspect.py": "be3166f3001bb8e5e6ea5ed40a66703bbf820a5bb2f349b384666e00527db89a",
+  "infra/docker-compose.yml": "bac24de4dc50419fd5de3a62bb0b178eabfbe6f06445fac0575eaa6f768f3f53",
+  "infra/make_bucket.sh": "d4bae26c2967ec47ee1c9bce837639480ef443cf4fd1e1cc7c999e8def6a4a41",
+  "infra/netem_down.sh": "f5b2a10f3ca713dd83a96e49daa7ebe538da333d7382f7eee1e85a5a45295f3b",
+  "infra/netem_up.sh": "a34f51f382a8810239ad2767edd9e64d512e3354087d1fa99327fcd91c092b55",
+  "infra/run_minio.sh": "d6fbe8228e46af59fbb5c3c35505dfb6feb22ae43cbc7084a3ec7a2b1f758114",
+  "infra/start_minio_native.sh": "8e2f6caaa804ab9ce8be2984878c255a55bbd77fd14f2b2e0f3bc5d32decbe55",
+  "plot_results.py": "e01de666378abefb9b42e1f8a22ee0d8f9a027276f54e48098e6b808b68d21b0",
+  "requirements.txt": "17d8143db9eecdc5578be35d504d4764e533e4d00f25431da888dd4411bf5215",
+  "run_benchmark.py": "d689dc3d89ff9fb6f524e39134b54003eac67175be22c3669b685d32951ce190",
+  "run_comparison.sh": "e0be52c2c4d123767b4d7e5664e202bb15a5c5d5733c32ec119244c12955952e",
+  "test_benchmark.py": "55185c5f446851a0014312bc7d5d4bd211652dac5cf77942317c7f5fed7e80cf",
+  "test_cache_inspect.py": "c584189bc7ef5f7098ac03ac2304fff3ddb41d2085c23ce077c675f91e76b8d4",
+  "test_lance_integration.py": "af4a860c5b42cecf3e2ad2d8715965caf7ff55cdfd02c30661cefcde0447c93e"
+}

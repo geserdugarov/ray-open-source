@@ -1,0 +1,135 @@
+{
+  "arguments": {
+    "actor_resource": null,
+    "batch_rows": 200000,
+    "bucket": "lance-bench",
+    "cpus_per_actor": 1.0,
+    "dataset_uri": null,
+    "dim": 256,
+    "drop_l2_page_cache_on_restart": false,
+    "endpoint_url": "http://192.168.201.98:9000",
+    "index_name": "vector_idx",
+    "invalidation_drill": false,
+    "k_list": "10",
+    "l2_run_id": "perf-final-20261014-fit-1",
+    "lance_build_commit": "ee7c7c6c2c8a989bb0ee51339ec3b69eb638b591",
+    "lance_cpu_threads": 1,
+    "lance_io_threads": 8,
+    "measure_queries": 256,
+    "measure_restart": true,
+    "memory_mb": null,
+    "metadata_l1_mb": 16,
+    "nprobes": 16,
+    "num_actors": 4,
+    "num_bits": 8,
+    "num_partitions": 512,
+    "nvme_dir": "/home/d00838679/lance-two-level-cache",
+    "out_dir": "/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014",
+    "partition_l1_mb": 1024,
+    "prewarm": "strict",
+    "prewarm_partitions": "all",
+    "ray_address": null,
+    "scale": 1000000,
+    "scenarios": "memory,distributed",
+    "seed": 42,
+    "skip_setup": false,
+    "warmup_queries": 16
+  },
+  "dataset": {
+    "dimension": 256,
+    "index_name": "vector_idx",
+    "num_bits": 8,
+    "num_partitions": 512,
+    "scale": 1000000,
+    "seed": 42
+  },
+  "dataset_uri": "s3://lance-bench/ivf_rq_def2414a8c5d/",
+  "lance_api": {
+    "LanceDataset.prewarm_index": "(self, name: 'str', *, with_position: 'bool' = False, partition_ids: 'Optional[Sequence[int]]' = None, index_segments: 'Optional[Iterable[Union[str, uuid.UUID]]]' = None)",
+    "Session.invalidate_index_cache": "(self, /, dataset_uri, index_addr)",
+    "Session.with_distributed_cache": "(l2_dir, index_metadata_l1_capacity_bytes, *, l1_partition_capacity_bytes=None)"
+  },
+  "lance_build_commit": "ee7c7c6c2c8a989bb0ee51339ec3b69eb638b591",
+  "lance_target_commits": {
+    "design_docs": "ee7c7c6c2",
+    "implementation": "bf6fa8d757d9525dbaa9b9b490417084c60288cf",
+    "usage_docs": "e5375e298"
+  },
+  "run_id": "perf-final-20261014-fit-1",
+  "session_specs": {
+    "distributed": [
+      {
+        "l2_dir": "/home/d00838679/lance-two-level-cache/perf-final-20261014-fit-1/actor-0",
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "distributed"
+      },
+      {
+        "l2_dir": "/home/d00838679/lance-two-level-cache/perf-final-20261014-fit-1/actor-1",
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "distributed"
+      },
+      {
+        "l2_dir": "/home/d00838679/lance-two-level-cache/perf-final-20261014-fit-1/actor-2",
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "distributed"
+      },
+      {
+        "l2_dir": "/home/d00838679/lance-two-level-cache/perf-final-20261014-fit-1/actor-3",
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "distributed"
+      }
+    ],
+    "memory": [
+      {
+        "l2_dir": null,
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "memory"
+      },
+      {
+        "l2_dir": null,
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "memory"
+      },
+      {
+        "l2_dir": null,
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "memory"
+      },
+      {
+        "l2_dir": null,
+        "memory_capacity_bytes": 1090519040,
+        "metadata_capacity_bytes": 16777216,
+        "partition_capacity_bytes": 1073741824,
+        "scenario": "memory"
+      }
+    ]
+  },
+  "versions": {
+    "lance": "12.0.0",
+    "numpy": "2.5.4",
+    "pyarrow": "26.0.0",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "ray": "2.58.0"
+  },
+  "worker_environment": {
+    "LANCE_CPU_THREADS": "1",
+    "LANCE_IO_THREADS": "8",
+    "MKL_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1"
+  }
+}

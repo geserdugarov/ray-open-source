@@ -1,0 +1,36 @@
+2026-10-14 10:35:53,505	INFO worker.py:2015 -- Started a local Ray instance. View the dashboard at [1m[32mhttp://127.0.0.1:8265 [39m[22m
+2026-10-14 10:35:53,514	WARNING working_dir.py:91 -- Directory '.venv' is now ignored by default when packaging the working directory. To disable this behavior, set the `RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES=''` environment variable.
+2026-10-14 10:35:53,515	WARNING working_dir.py:91 -- Directory '__pycache__' is now ignored by default when packaging the working directory. To disable this behavior, set the `RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES=''` environment variable.
+2026-10-14 10:35:53,520	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.gitignore')]
+2026-10-14 10:35:53,557	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.venv/.gitignore')]
+2026-10-14 10:35:53,561	INFO packaging.py:734 -- Creating a file package for local module '/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache'.
+2026-10-14 10:35:53,561	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.gitignore')]
+2026-10-14 10:35:53,574	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.venv/.gitignore')]
+2026-10-14 10:35:53,575	INFO packaging.py:434 -- Pushing file package 'gcs://_ray_pkg_2ecf6724cb44aef4.zip' (0.11MiB) to Ray cluster...
+2026-10-14 10:35:53,576	INFO packaging.py:447 -- Successfully pushed file package 'gcs://_ray_pkg_2ecf6724cb44aef4.zip'.
+[setup] reusing dataset and index 'vector_idx' at s3://lance-bench/ivf_rq_def2414a8c5d/
+
+=== distributed ===
+  aggregate prewarm wall=10.45s
+  actor-0 prewarm=10.33s L2=/home/d00838679/lance-two-level-cache/perf-final-cold-20261014-small-2/actor-0 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-1 prewarm=10.35s L2=/home/d00838679/lance-two-level-cache/perf-final-cold-20261014-small-2/actor-1 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-2 prewarm=10.39s L2=/home/d00838679/lance-two-level-cache/perf-final-cold-20261014-small-2/actor-2 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-3 prewarm=10.42s L2=/home/d00838679/lance-two-level-cache/perf-final-cold-20261014-small-2/actor-3 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  distributed      initial              k=10    p50=    7.46 ms p95=   11.52 ms p99=   13.84 ms throughput=  499.40 q/s index_L1_weight=130.5 MiB L2=1.2 GiB source=0 B
+  distributed      l1_warm              k=10    p50=    5.15 ms p95=    7.00 ms p99=    7.96 ms throughput=  723.25 q/s index_L1_weight=131.4 MiB L2=1.2 GiB source=0 B
+  distributed      process_restart      k=10    p50=    9.92 ms p95=   16.67 ms p99=   53.74 ms throughput=  361.83 q/s index_L1_weight=131.5 MiB L2=1.2 GiB source=3.0 MiB
+
+=== memory ===
+  aggregate prewarm wall=10.51s
+  actor-0 prewarm=10.36s L1=47.7 MiB
+  actor-1 prewarm=10.36s L1=47.7 MiB
+  actor-2 prewarm=10.51s L1=47.8 MiB
+  actor-3 prewarm=10.35s L1=48.1 MiB
+  memory           initial              k=10    p50=  274.63 ms p95=  334.73 ms p99=  349.96 ms throughput=   14.37 q/s index_L1_weight=190.8 MiB L2=0 B source=1.9 GiB
+  memory           l1_warm              k=10    p50=  275.98 ms p95=  326.98 ms p99=  343.79 ms throughput=   14.60 q/s index_L1_weight=191.1 MiB L2=0 B source=1.9 GiB
+  memory           process_restart      k=10    p50=  277.49 ms p95=  332.11 ms p99=  364.88 ms throughput=   14.31 q/s index_L1_weight=190.9 MiB L2=0 B source=1.9 GiB
+Query row IDs match across all scenarios and phases.
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-cold-20261014/perf-final-cold-20261014-small-2/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-cold-20261014/perf-final-cold-20261014-small-2/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-cold-20261014/perf-final-cold-20261014-small-2/summary.csv

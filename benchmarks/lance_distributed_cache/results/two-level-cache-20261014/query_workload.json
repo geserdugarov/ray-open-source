@@ -1,0 +1,9 @@
+{
+  "query_seed": 44,
+  "query_count": 256,
+  "query_dimension": 256,
+  "queries_match_dataset_vectors": true,
+  "dataset_row_offsets_start": 400000,
+  "dataset_row_offsets_end_exclusive": 400256,
+  "dataset_batch_rows": 200000
+}

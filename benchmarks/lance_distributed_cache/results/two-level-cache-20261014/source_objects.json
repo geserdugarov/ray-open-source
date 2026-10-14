@@ -1,0 +1,37 @@
+[
+  {
+    "key": "ivf_rq_def2414a8c5d/_indices/bdece810-56cb-4bdd-a943-bfa3193b0a85/auxiliary.idx",
+    "bytes": 278710981,
+    "etag": "\"500eca61d659c0610dff1abb8bf8b926-54\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/_indices/bdece810-56cb-4bdd-a943-bfa3193b0a85/index.idx",
+    "bytes": 527174,
+    "etag": "\"7467bdd38ffc689c870de59bac1cc108\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/_transactions/0-ff6cc0b4-bf61-4775-a9e2-40f16a49b229.txn",
+    "bytes": 176,
+    "etag": "\"69d7bd067897aab3459bc84c29c31f61\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/_transactions/1-5d7b74a5-a928-45ed-9477-6c8a6584bf53.txn",
+    "bytes": 379,
+    "etag": "\"0ac5a5185e88adb93cc245d9fe93ae30\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/_versions/18446744073709551613.manifest",
+    "bytes": 975,
+    "etag": "\"b5bea0c22ed550008e74538eeba353b5\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/_versions/18446744073709551614.manifest",
+    "bytes": 430,
+    "etag": "\"c2d71a8cf1428fa0ed73abfe56b8cfbe\""
+  },
+  {
+    "key": "ivf_rq_def2414a8c5d/data/01101110011111100010011188c3224e62a0528fb769d260d3.lance",
+    "bytes": 1024000619,
+    "etag": "\"ebe9be2645628db62ba9ae38fee62b29-149\""
+  }
+]

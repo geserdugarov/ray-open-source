@@ -1,0 +1,33 @@
+{
+  "unittest": {
+    "command": ".venv/bin/python -m unittest discover -p test_*.py -v",
+    "tests": 34,
+    "status": "passed",
+    "build": "release-with-debug"
+  },
+  "ruff": {
+    "version": "0.8.4",
+    "commands": [
+      ".venv/bin/ruff check .",
+      ".venv/bin/ruff check --select I benchmark_lib.py run_benchmark.py test_benchmark.py test_lance_integration.py analyze_comparison.py"
+    ],
+    "status": "passed"
+  },
+  "black": {
+    "version": "22.10.0",
+    "command": ".venv/bin/black --check .",
+    "status": "passed"
+  },
+  "shellcheck": {
+    "command": "shellcheck run_comparison.sh infra/start_minio_native.sh infra/make_bucket.sh",
+    "status": "passed"
+  },
+  "git_diff_check": {
+    "command": "git diff --check",
+    "status": "passed"
+  },
+  "lance_working_tree": {
+    "commit": "ee7c7c6c2c8a989bb0ee51339ec3b69eb638b591",
+    "status": "clean"
+  }
+}

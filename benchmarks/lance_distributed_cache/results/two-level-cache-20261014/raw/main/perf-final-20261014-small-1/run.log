@@ -1,0 +1,53 @@
+2026-10-14 10:18:19,187	INFO worker.py:2015 -- Started a local Ray instance. View the dashboard at [1m[32mhttp://127.0.0.1:8265 [39m[22m
+2026-10-14 10:18:19,193	WARNING working_dir.py:91 -- Directory '.venv' is now ignored by default when packaging the working directory. To disable this behavior, set the `RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES=''` environment variable.
+2026-10-14 10:18:19,193	WARNING working_dir.py:91 -- Directory '__pycache__' is now ignored by default when packaging the working directory. To disable this behavior, set the `RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES=''` environment variable.
+2026-10-14 10:18:19,194	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.gitignore')]
+2026-10-14 10:18:19,200	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.venv/.gitignore')]
+2026-10-14 10:18:19,201	INFO packaging.py:734 -- Creating a file package for local module '/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache'.
+2026-10-14 10:18:19,201	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.gitignore')]
+2026-10-14 10:18:19,207	INFO packaging.py:363 -- Ignoring upload to cluster for these files: [PosixPath('/home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/.venv/.gitignore')]
+2026-10-14 10:18:19,207	INFO packaging.py:434 -- Pushing file package 'gcs://_ray_pkg_2ecf6724cb44aef4.zip' (0.11MiB) to Ray cluster...
+2026-10-14 10:18:19,208	INFO packaging.py:447 -- Successfully pushed file package 'gcs://_ray_pkg_2ecf6724cb44aef4.zip'.
+[setup] reusing dataset and index 'vector_idx' at s3://lance-bench/ivf_rq_def2414a8c5d/
+
+=== no-index-cache ===
+  aggregate prewarm wall=10.37s
+  actor-0 prewarm=10.10s L1=221.3 KiB
+  actor-1 prewarm=10.37s L1=221.3 KiB
+  actor-2 prewarm=10.10s L1=221.3 KiB
+  actor-3 prewarm=10.09s L1=221.3 KiB
+  no-index-cache   initial              k=10    p50=  392.85 ms p95=  413.03 ms p99=  417.94 ms throughput=   10.19 q/s index_L1_weight=0 B L2=0 B source=2.7 GiB
+  no-index-cache   l1_warm              k=10    p50=  392.54 ms p95=  410.47 ms p99=  418.44 ms throughput=   10.21 q/s index_L1_weight=0 B L2=0 B source=2.7 GiB
+  no-index-cache   process_restart      k=10    p50=  391.60 ms p95=  414.15 ms p99=  426.19 ms throughput=   10.17 q/s index_L1_weight=0 B L2=0 B source=2.7 GiB
+
+=== memory ===
+  aggregate prewarm wall=10.35s
+  actor-0 prewarm=10.29s L1=47.8 MiB
+  actor-1 prewarm=10.30s L1=47.9 MiB
+  actor-2 prewarm=10.35s L1=47.9 MiB
+  actor-3 prewarm=10.31s L1=47.7 MiB
+  memory           initial              k=10    p50=  277.56 ms p95=  331.02 ms p99=  353.60 ms throughput=   14.40 q/s index_L1_weight=190.7 MiB L2=0 B source=1.9 GiB
+  memory           l1_warm              k=10    p50=  273.15 ms p95=  326.88 ms p99=  345.56 ms throughput=   14.58 q/s index_L1_weight=191.0 MiB L2=0 B source=1.9 GiB
+  memory           process_restart      k=10    p50=  279.08 ms p95=  329.18 ms p99=  367.16 ms throughput=   14.31 q/s index_L1_weight=190.9 MiB L2=0 B source=1.9 GiB
+
+=== distributed ===
+  aggregate prewarm wall=10.42s
+  actor-0 prewarm=10.34s L2=/home/d00838679/lance-two-level-cache/perf-final-20261014-small-1/actor-0 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-1 prewarm=10.38s L2=/home/d00838679/lance-two-level-cache/perf-final-20261014-small-1/actor-1 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-2 prewarm=10.34s L2=/home/d00838679/lance-two-level-cache/perf-final-20261014-small-1/actor-2 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  actor-3 prewarm=10.38s L2=/home/d00838679/lance-two-level-cache/perf-final-20261014-small-1/actor-3 entries=512 namespaces=1 apparent=303.8 MiB disk=304.8 MiB tombstones=0
+  distributed      initial              k=10    p50=    6.86 ms p95=   11.17 ms p99=   13.43 ms throughput=  521.24 q/s index_L1_weight=131.5 MiB L2=1.2 GiB source=0 B
+  distributed      l1_warm              k=10    p50=    4.81 ms p95=    5.75 ms p99=    6.17 ms throughput=  810.69 q/s index_L1_weight=131.1 MiB L2=1.2 GiB source=0 B
+  distributed      process_restart      k=10    p50=    4.66 ms p95=    6.55 ms p99=   39.49 ms throughput=  716.98 q/s index_L1_weight=131.2 MiB L2=1.2 GiB source=3.0 MiB
+  aggregate invalidation wall=0.064s
+  actor-0 invalidated 1 segment(s) in 0.031s
+  actor-1 invalidated 1 segment(s) in 0.032s
+  actor-2 invalidated 1 segment(s) in 0.032s
+  actor-3 invalidated 1 segment(s) in 0.028s
+  aggregate rehydrate wall=10.71s
+  distributed      post_invalidation_rehydrate k=10    p50=    6.79 ms p95=   10.90 ms p99=   12.32 ms throughput=  539.93 q/s index_L1_weight=131.5 MiB L2=1.2 GiB source=0 B
+Query row IDs match across all scenarios and phases.
+
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/run.json
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/events.jsonl
+Wrote /home/d00838679/git/ray-open-source/benchmarks/lance_distributed_cache/out/perf-final-20261014/perf-final-20261014-small-1/summary.csv
