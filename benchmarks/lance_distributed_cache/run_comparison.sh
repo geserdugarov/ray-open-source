@@ -21,14 +21,18 @@ common=(
   "${HERE}/run_benchmark.py"
   --scale "${SCALE:-1000000}" --dim "${DIM:-256}"
   --num-partitions "${NUM_PARTITIONS:-512}" --num-bits 8
-  --num-actors 4 --cpus-per-actor 1
+  --num-actors "${NUM_ACTORS:-4}" --cpus-per-actor 1
   --metadata-l1-mb 16 --prewarm strict
   --measure-queries "${MEASURE_QUERIES:-256}" --warmup-queries 16
   --k-list 10 --nprobes "${NPROBES:-16}"
   --lance-cpu-threads 1 --lance-io-threads 8
   --endpoint-url "${ENDPOINT_URL}"
+  --bucket "${BUCKET:-lance-bench}"
   --nvme-dir "${NVME_DIR}" --out-dir "${OUT_DIR}"
 )
+if [[ -n "${ACTOR_RESOURCE:-}" ]]; then
+  common+=(--actor-resource "${ACTOR_RESOURCE}")
+fi
 
 for ((trial=1; trial<=REPETITIONS; trial++)); do
   case $((trial % 3)) in
@@ -48,8 +52,11 @@ for ((trial=1; trial<=REPETITIONS; trial++)); do
       options+=(--invalidation-drill)
     fi
     printf 'Running %s\n' "${run_id}"
-    "${BENCH_PYTHON}" -u "${common[@]}" "${options[@]}" --l2-run-id "${run_id}" \
-      > "${OUT_DIR}/${run_id}.log" 2>&1
+    if ! "${BENCH_PYTHON}" -u "${common[@]}" "${options[@]}" --l2-run-id "${run_id}" "$@" \
+      > "${OUT_DIR}/${run_id}.log" 2>&1; then
+      tail -n 80 "${OUT_DIR}/${run_id}.log" >&2
+      exit 1
+    fi
     tail -n 4 "${OUT_DIR}/${run_id}.log"
   done
 done

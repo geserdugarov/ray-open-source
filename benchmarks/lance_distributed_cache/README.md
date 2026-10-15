@@ -206,6 +206,22 @@ operator choice. The benchmark never removes an L2 directory.
 
 ## Multi-node Ray runs
 
+For the head + two workers + separate MinIO topology, use the
+[real-cluster scripts and quickstart](infra/REAL_CLUSTER.md):
+
+```bash
+cd benchmarks/lance_distributed_cache
+cp infra/real_cluster.env.example infra/real_cluster.env
+# Edit node addresses, NVMe path, and the locally built LANCE_WHEEL.
+bash infra/build_wheelhouse.sh
+bash infra/ship_real_cluster.sh
+bash infra/run_real_cluster.sh start
+bash infra/run_real_cluster.sh minio
+bash infra/run_real_cluster.sh smoke
+bash infra/run_real_cluster.sh run
+bash infra/run_real_cluster.sh fetch
+```
+
 Install the same Ray and pylance builds on every node and use a dataset URI
 reachable from every actor. Then pass `--ray-address auto` (or set
 `RAY_ADDRESS`). The driver records each actor's Ray node ID and pins restarted
