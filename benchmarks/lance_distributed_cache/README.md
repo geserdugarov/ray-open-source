@@ -291,6 +291,11 @@ three cache capacities over three trials, plus three trials with explicit file-p
 eviction before restart. It includes raw actor events, exact build information,
 source IO, cache footprints, validation, and throughput plots.
 
+The [October 15 real-cluster report](results/two-level-cache-real-cluster-20261015/report.md)
+covers a single run on two physical workers with a 32 MiB partition L1 per
+actor. It includes the supplied artifacts, throughput and latency comparisons,
+source IO, and the limits of restart measurements without file-page eviction.
+
 ## Interpreting results
 
 - Compare `process_restart` across scenarios to isolate the benefit of

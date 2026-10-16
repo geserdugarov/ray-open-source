@@ -1,0 +1,50 @@
+{
+  "checks": {
+    "physical_disk_read_bytes_zero_in_all_summary_rows": true,
+    "query_executions_in_summary": 2304,
+    "summary_rows": 9,
+    "throughput_matches_query_count_over_wall_time": true
+  },
+  "comparisons": {
+    "initial": {
+      "p50_latency_ratio_vs_memory": 537.9609993120843,
+      "p95_latency_ratio_vs_memory": 427.72664936985336,
+      "source_read_GiB_memory": 1.8758345991373062,
+      "source_read_GiB_no_index_cache": 2.6651694029569626,
+      "source_read_MiB_distributed": 0.0,
+      "source_read_reduction_vs_memory_pct": 100.0,
+      "throughput_ratio_vs_memory": 453.21362331553723,
+      "throughput_ratio_vs_no_index_cache": 612.0409530355868
+    },
+    "l1_warm": {
+      "p50_latency_ratio_vs_memory": 586.4813721648409,
+      "p95_latency_ratio_vs_memory": 515.2854203101524,
+      "source_read_GiB_memory": 1.8884618803858757,
+      "source_read_GiB_no_index_cache": 2.6651694029569626,
+      "source_read_MiB_distributed": 0.0,
+      "source_read_reduction_vs_memory_pct": 100.0,
+      "throughput_ratio_vs_memory": 503.63162168686335,
+      "throughput_ratio_vs_no_index_cache": 673.0539303274558
+    },
+    "process_restart": {
+      "p50_latency_ratio_vs_memory": 601.4469985256062,
+      "p95_latency_ratio_vs_memory": 404.2693978151513,
+      "source_read_GiB_memory": 1.898135058581829,
+      "source_read_GiB_no_index_cache": 2.665504239499569,
+      "source_read_MiB_distributed": 1.5068817138671875,
+      "source_read_reduction_vs_memory_pct": 99.92247315768995,
+      "throughput_ratio_vs_memory": 456.7640353986772,
+      "throughput_ratio_vs_no_index_cache": 613.6281345107748
+    }
+  },
+  "event_excerpt": {
+    "actor_sample_queries": 128,
+    "actor_sample_returned_rows": 1280,
+    "complete_event_stream": false,
+    "events": 6,
+    "measurement_events": 1,
+    "no_index_cache_prewarm_source_read_bytes": 595614308,
+    "no_index_cache_prewarm_source_read_iops": 8792
+  },
+  "recorded_lance_build_commit": null
+}
