@@ -20,12 +20,14 @@ from typing import Any, Dict, Sequence
 
 import numpy as np
 from benchmark_lib import (
+    CACHE_TIERS,
     MIB,
     SCENARIOS,
     DatasetSpec,
     SessionSpec,
     aggregate_phase,
     build_session,
+    cache_metrics_delta,
     ensure_dataset,
     make_query_vectors,
     minio_storage_options,
@@ -132,6 +134,7 @@ class CacheWorker:
             "index_addresses": resolve_index_addresses(self.dataset, index_name),
             "session_size_bytes": int(self.session.size_bytes()),
             "l2_snapshot": self._snapshot(),
+            "index_cache_stats": self.session.index_cache_stats(),
         }
 
     def _run_query(self, query: np.ndarray, k: int):
@@ -155,6 +158,7 @@ class CacheWorker:
         warmup_k: int,
     ) -> Dict[str, Any]:
         before = self._snapshot()
+        cache_before = self.session.index_cache_stats()
         io_before = self.dataset.io_stats_snapshot()
         size_before = int(self.session.size_bytes())
         started = time.perf_counter()
@@ -169,7 +173,8 @@ class CacheWorker:
             raise ValueError(f"unknown prewarm mode: {mode!r}")
         duration_s = time.perf_counter() - started
         io_after = self.dataset.io_stats_snapshot()
-        index_cache_weight_bytes = int(self.session.index_cache_size_bytes())
+        cache_after = self.session.index_cache_stats()
+        index_cache_weight_bytes = int(cache_after["size_bytes"])
         after = self._snapshot()
         return {
             "event": "prewarm",
@@ -185,6 +190,9 @@ class CacheWorker:
             "l2_before": before,
             "l2_after": after,
             "l2_delta": diff_snapshots(before, after) if before and after else None,
+            "index_cache_stats_before": cache_before,
+            "index_cache_stats_after": cache_after,
+            "cache_metrics": cache_metrics_delta(cache_before, cache_after),
         }
 
     def measure(
@@ -239,14 +247,18 @@ class CacheWorker:
             ),
         }
 
+    def cache_stats(self) -> Dict[str, Any]:
+        return self.session.index_cache_stats()
+
     def measurement_stats(self) -> Dict[str, Any]:
         # Moka maintenance and directory scans can dominate a short cached pass.
         # Collect them in a separate RPC after the driver stops its timer.
-        index_cache_weight_bytes = int(self.session.index_cache_size_bytes())
+        cache_stats = self.session.index_cache_stats()
         return {
             "session_size_bytes": int(self.session.size_bytes()),
-            "index_cache_weight_bytes": index_cache_weight_bytes,
+            "index_cache_weight_bytes": int(cache_stats["size_bytes"]),
             "l2_snapshot": self._snapshot(),
+            "index_cache_stats_after": cache_stats,
         }
 
     def invalidate(self, index_name: str) -> Dict[str, Any]:
@@ -459,6 +471,10 @@ def _validate_lance_api(lance_module) -> None:
         ),
     }
     failures = []
+    if not hasattr(lance_module.Session, "index_cache_stats"):
+        failures.append(
+            "Session.index_cache_stats is missing (rebuild the Lance wheel)"
+        )
     for label, (callable_object, required) in required_parameters.items():
         parameters = set(inspect.signature(callable_object).parameters)
         missing = sorted(required - parameters)
@@ -467,7 +483,7 @@ def _validate_lance_api(lance_module) -> None:
     if failures:
         raise RuntimeError(
             "installed pylance does not expose the Lance 12 distributed-cache "
-            "API from bf6fa8d75: " + "; ".join(failures)
+            "API and cache counters: " + "; ".join(failures)
         )
 
 
@@ -557,6 +573,7 @@ def _measure_phase(
     all_rows = []
     # Each k needs its own concurrent pass and wall time for meaningful QPS.
     for k in k_values:
+        cache_before = ray_module.get([actor.cache_stats.remote() for actor in actors])
         started = time.perf_counter()
         actor_results = ray_module.get(
             [
@@ -568,8 +585,12 @@ def _measure_phase(
         snapshots = ray_module.get(
             [actor.measurement_stats.remote() for actor in actors]
         )
-        for result, snapshot in zip(actor_results, snapshots):
+        for result, snapshot, before in zip(actor_results, snapshots, cache_before):
             result.update(snapshot)
+            result["index_cache_stats_before"] = before
+            result["cache_metrics"] = cache_metrics_delta(
+                before, result["index_cache_stats_after"]
+            )
         all_results.extend(actor_results)
         all_rows.extend(
             aggregate_phase(
@@ -595,6 +616,15 @@ def _print_rows(rows: Sequence[Dict[str, Any]]) -> None:
             f"L2={format_bytes(row['l2_apparent_bytes'])} "
             f"source={format_bytes(row['source_read_bytes'])}"
         )
+        ratios = []
+        for tier in CACHE_TIERS:
+            ratio = row[f"{tier}_hit_ratio"]
+            hits, misses = row[f"{tier}_hits"], row[f"{tier}_misses"]
+            value = f"{ratio:.2%}" if ratio is not None else "n/a"
+            if hits is not None and misses is not None:
+                value += f" ({hits}/{hits + misses})"
+            ratios.append(f"{tier}={value}")
+        print("    cache hits: " + ", ".join(ratios))
 
 
 def _write_outputs(
@@ -917,6 +947,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lance_target_commits": TARGET_LANCE_COMMITS,
         "lance_build_commit": args.lance_build_commit,
         "lance_api": {
+            "Session.index_cache_stats": str(
+                inspect.signature(lance.Session.index_cache_stats)
+            ),
             "Session.with_distributed_cache": str(
                 inspect.signature(lance.Session.with_distributed_cache)
             ),

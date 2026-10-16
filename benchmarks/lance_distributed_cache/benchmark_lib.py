@@ -12,6 +12,88 @@ from typing import Any, Dict, Generator, Iterable, Sequence
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 SCENARIOS = ("no-index-cache", "memory", "distributed")
+CACHE_TIERS = ("index_cache", "l1", "l1_metadata", "l1_partition", "l2")
+L2_COUNTERS = (
+    "l2_writes",
+    "l2_write_bytes",
+    "l2_read_bytes",
+    "l2_write_errors",
+    "l2_decode_errors",
+    "l2_stale_loader_discards",
+    "l2_invalidate_errors",
+    "l2_prewarm_skip_corrupt",
+    "l2_skipped_non_partition",
+    "l2_tombstone_strict_skips",
+)
+
+
+def cache_metrics_delta(
+    before: Dict[str, Any], after: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Count logical cache lookups within one pass, excluding prior warmup."""
+
+    def delta(old, new, name):
+        value = int(new[name]) - int(old[name])
+        if value < 0:
+            raise ValueError(f"cache counter {name} decreased during a pass")
+        return value
+
+    metrics = {
+        "index_cache_hits": delta(before, after, "hits"),
+        "index_cache_misses": delta(before, after, "misses"),
+    }
+    old_distributed = before["distributed"]
+    new_distributed = after["distributed"]
+    if (old_distributed is None) != (new_distributed is None):
+        raise ValueError("cache backend changed during a pass")
+    if new_distributed is None:
+        metrics.update(
+            l1_hits=metrics["index_cache_hits"],
+            l1_misses=metrics["index_cache_misses"],
+        )
+        for tier in ("l1_metadata", "l1_partition", "l2"):
+            metrics[f"{tier}_hits"] = None
+            metrics[f"{tier}_misses"] = None
+        metrics.update({name: None for name in L2_COUNTERS})
+    else:
+        for tier in ("l1_metadata", "l1_partition", "l2"):
+            for outcome in ("hits", "misses"):
+                name = f"{tier}_{outcome}"
+                metrics[name] = delta(old_distributed, new_distributed, f"{name}_total")
+        for outcome in ("hits", "misses"):
+            metrics[f"l1_{outcome}"] = (
+                metrics[f"l1_metadata_{outcome}"] + metrics[f"l1_partition_{outcome}"]
+            )
+        metrics.update(
+            {
+                name: delta(old_distributed, new_distributed, f"{name}_total")
+                for name in L2_COUNTERS
+            }
+        )
+    return aggregate_cache_metrics([metrics])
+
+
+def aggregate_cache_metrics(metrics: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pool lookup counts before calculating ratios; absent counters stay unknown."""
+    counts = {}
+    names = [
+        f"{tier}_{outcome}" for tier in CACHE_TIERS for outcome in ("hits", "misses")
+    ] + list(L2_COUNTERS)
+    for name in names:
+        values = [item.get(name) for item in metrics]
+        counts[name] = (
+            sum(values)
+            if values and all(value is not None for value in values)
+            else None
+        )
+    for tier in CACHE_TIERS:
+        hits, misses = counts[f"{tier}_hits"], counts[f"{tier}_misses"]
+        counts[f"{tier}_hit_ratio"] = (
+            hits / (hits + misses)
+            if hits is not None and misses is not None and hits + misses
+            else None
+        )
+    return counts
 
 
 @dataclass(frozen=True)
@@ -353,6 +435,9 @@ def aggregate_phase(
                         for result in actor_results
                     )
                     else None
+                ),
+                **aggregate_cache_metrics(
+                    [result.get("cache_metrics", {}) for result in actor_results]
                 ),
             }
         )

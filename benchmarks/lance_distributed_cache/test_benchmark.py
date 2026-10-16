@@ -8,11 +8,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from benchmark_lib import (
+    L2_COUNTERS,
     MIB,
     DatasetSpec,
     SessionSpec,
+    aggregate_cache_metrics,
     aggregate_phase,
     build_session,
+    cache_metrics_delta,
     parse_int_list,
     parse_partition_selection,
     resolve_index_addresses,
@@ -137,6 +140,9 @@ class ParsingTest(unittest.TestCase):
 class LanceApiValidationTest(unittest.TestCase):
     def test_accepts_requested_surface(self):
         class Session:
+            def index_cache_stats(self):
+                pass
+
             @staticmethod
             def with_distributed_cache(
                 l2_dir,
@@ -156,9 +162,17 @@ class LanceApiValidationTest(unittest.TestCase):
         _validate_lance_api(
             types.SimpleNamespace(Session=Session, LanceDataset=Dataset)
         )
+        del Session.index_cache_stats
+        with self.assertRaisesRegex(RuntimeError, "index_cache_stats.*rebuild"):
+            _validate_lance_api(
+                types.SimpleNamespace(Session=Session, LanceDataset=Dataset)
+            )
 
     def test_rejects_old_partition_l1_keyword(self):
         class Session:
+            def index_cache_stats(self):
+                pass
+
             @staticmethod
             def with_distributed_cache(
                 l2_dir,
@@ -267,9 +281,22 @@ class AggregatePhaseTest(unittest.TestCase):
         def stats():
             # Deliberately slower than the query pass; this must not affect QPS.
             clock[0] += 100
-            return {"session_size_bytes": 0, "index_cache_weight_bytes": 10}
+            return {
+                "session_size_bytes": 0,
+                "index_cache_weight_bytes": 10,
+                "index_cache_stats_after": {
+                    "hits": 109,
+                    "misses": 101,
+                    "distributed": None,
+                },
+            }
+
+        def before_stats():
+            clock[0] += 100
+            return {"hits": 100, "misses": 100, "distributed": None}
 
         actor = types.SimpleNamespace(
+            cache_stats=types.SimpleNamespace(remote=before_stats),
             measure=types.SimpleNamespace(remote=measure),
             measurement_stats=types.SimpleNamespace(remote=stats),
         )
@@ -286,7 +313,73 @@ class AggregatePhaseTest(unittest.TestCase):
         self.assertEqual([row["wall_time_s"] for row in rows], [2, 4])
         self.assertEqual([row["throughput_qps"] for row in rows], [2, 1])
         self.assertEqual([row["index_cache_weight_bytes"] for row in rows], [20, 20])
+        self.assertEqual([row["l1_hits"] for row in rows], [18, 18])
+        self.assertEqual([row["l1_hit_ratio"] for row in rows], [0.9, 0.9])
         self.assertIsNone(rows[0]["process_disk_read_bytes"])
+
+
+class CacheMetricsTest(unittest.TestCase):
+    def test_memory_delta_excludes_previous_passes_and_l2_is_unavailable(self):
+        delta = cache_metrics_delta(
+            {"hits": 1000, "misses": 500, "distributed": None},
+            {"hits": 1003, "misses": 501, "distributed": None},
+        )
+        metrics = aggregate_cache_metrics([delta])
+        self.assertEqual(delta["l1_hit_ratio"], 0.75)
+        self.assertEqual(metrics["index_cache_hits"], 3)
+        self.assertEqual(metrics["index_cache_misses"], 1)
+        self.assertEqual(metrics["l1_hit_ratio"], 0.75)
+        self.assertIsNone(metrics["l2_hits"])
+        self.assertIsNone(metrics["l2_hit_ratio"])
+        self.assertIsNone(metrics["l1_partition_hits"])
+
+    def test_distributed_counts_and_pooled_ratios(self):
+        counters = {
+            "l1_metadata_hits_total": 10,
+            "l1_metadata_misses_total": 0,
+            "l1_partition_hits_total": 1,
+            "l1_partition_misses_total": 9,
+            "l2_hits_total": 9,
+            "l2_misses_total": 0,
+            **{f"{name}_total": 0 for name in L2_COUNTERS},
+            "l2_read_bytes_total": 2048,
+        }
+        distributed = cache_metrics_delta(
+            {"hits": 100, "misses": 50, "distributed": {name: 50 for name in counters}},
+            {
+                "hits": 120,
+                "misses": 50,
+                "distributed": {name: 50 + value for name, value in counters.items()},
+            },
+        )
+        metrics = aggregate_cache_metrics([distributed])
+        self.assertEqual(metrics["l1_hit_ratio"], 11 / 20)
+        self.assertEqual(metrics["l1_partition_hit_ratio"], 0.1)
+        self.assertEqual(metrics["l1_metadata_hit_ratio"], 1.0)
+        self.assertEqual(metrics["l2_hit_ratio"], 1.0)
+        self.assertEqual(metrics["index_cache_hit_ratio"], 1.0)
+        self.assertEqual(metrics["l2_read_bytes"], 2048)
+        other = {**distributed, "l1_partition_hits": 90, "l1_partition_misses": 0}
+        pooled = aggregate_cache_metrics([distributed, other])
+        self.assertEqual(pooled["l1_partition_hit_ratio"], 0.91)
+
+    def test_zero_lookups_and_partial_metrics_are_unknown(self):
+        for metrics in (
+            [{}],
+            [{"l1_hits": 0, "l1_misses": 0}],
+            [{"l1_hits": 1, "l1_misses": 0}, {}],
+        ):
+            with self.subTest(metrics=metrics):
+                result = aggregate_cache_metrics(metrics)
+                self.assertIsNone(result["l1_hit_ratio"])
+                self.assertIsNone(result["l2_hit_ratio"])
+
+    def test_counter_reset_and_backend_change_are_rejected(self):
+        before = {"hits": 10, "misses": 0, "distributed": None}
+        with self.assertRaisesRegex(ValueError, "decreased"):
+            cache_metrics_delta(before, {**before, "hits": 0})
+        with self.assertRaisesRegex(ValueError, "backend changed"):
+            cache_metrics_delta(before, {**before, "distributed": {}})
 
 
 class WorkerDiskIoTest(unittest.TestCase):

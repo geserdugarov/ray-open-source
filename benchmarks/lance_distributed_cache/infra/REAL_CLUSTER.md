@@ -52,6 +52,10 @@ Build pylance from the cache checkout as described in the benchmark
 exact wheel. If there is exactly one wheel in the sibling
 `lance-open-source/python/dist`, it is selected automatically. Building the
 wheelhouse reuses this artifact, so repeating a deploy does not compile Lance.
+The wheel must include `Session.index_cache_stats()` and the per-tier counters
+from the sibling Lance checkout. Earlier Lance 12 cache wheels need a rebuild;
+`--code-only` cannot add native counters. The verifier rejects wheels missing
+the new API before dependency downloads or shipping.
 
 Use a regular distribution wheel from `maturin build`. An editable wheel from
 `uv sync`, `maturin develop`, or uv's editable cache can contain only
@@ -167,6 +171,12 @@ reuses the source dataset/index; `--skip-setup` bypasses its validation. Pass
 `--drop-l2-page-cache-on-restart` to request file-page eviction before restart.
 Set `LANCE_BUILD_COMMIT` to the commit used for the supplied wheel to record
 its provenance in `run.json`.
+
+Every measured phase prints overall, L1, partition-L1, metadata-L1, and L2 hit
+ratios with their counts. `summary.csv` contains the same phase deltas, and
+`events.jsonl` includes cumulative before/after snapshots per actor. The L2
+ratio covers partition requests that miss L1. A memory-only scenario has no
+L2 counter; it is shown as `n/a` rather than a zero hit rate.
 
 The comparison uses the same profiles and rotated scenario order as the local
 comparison runner. Set `REPETITIONS` or `EXPERIMENT_ID` in the config to change

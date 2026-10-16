@@ -55,6 +55,11 @@ if [[ "$dataset" != *partition_ids* || "$bindings" != *l1_partition_capacity_byt
   printf 'Wheel is missing the Lance 12 two-level cache API: %s\n' "$wheel" >&2
   exit 1
 fi
+if [[ "$bindings" != *index_cache_stats* ]]; then
+  printf 'Wheel is missing Session.index_cache_stats: %s\n' "$wheel" >&2
+  echo "Rebuild Lance with the cache-counter changes, then rebuild the wheelhouse." >&2
+  exit 1
+fi
 if [[ -n "$WHEELHOUSE" && -f "$WHEELHOUSE/SHA256SUMS" ]]; then
   (cd -- "$WHEELHOUSE" && sha256sum --check --quiet SHA256SUMS)
 fi

@@ -11,7 +11,13 @@ from statistics import median
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from benchmark_lib import percentiles, validate_result_digests
+from benchmark_lib import (
+    CACHE_TIERS,
+    L2_COUNTERS,
+    aggregate_cache_metrics,
+    percentiles,
+    validate_result_digests,
+)
 from cache_inspect import invalidation_errors
 
 
@@ -142,6 +148,20 @@ def analyze(input_dir: Path, output_dir: Path) -> None:
                 else None
             ),
         }
+        counter_names = [
+            f"{tier}_{outcome}"
+            for tier in CACHE_TIERS
+            for outcome in ("hits", "misses")
+        ] + list(L2_COUNTERS)
+        counters = [
+            {
+                name: int(value) if pd.notna(value) else None
+                for name, value in record.items()
+                if name in counter_names
+            }
+            for record in frame.to_dict("records")
+        ]
+        row.update(aggregate_cache_metrics(counters))
         if first_queries[key]:
             row["restart_first_query_p50_s"] = percentiles(first_queries[key])["p50_s"]
             row["restart_first_query_n"] = len(first_queries[key])

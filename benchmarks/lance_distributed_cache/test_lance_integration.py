@@ -19,8 +19,11 @@ try:
         and "partition_ids"
         in inspect.signature(lance.LanceDataset.prewarm_index).parameters
         and hasattr(lance.Session, "invalidate_index_cache")
+        and hasattr(lance.Session, "index_cache_stats")
     )
-    _SKIP_REASON = "installed pylance does not expose the Lance 12 cache API"
+    _SKIP_REASON = (
+        "installed pylance does not expose the Lance 12 cache API and counters"
+    )
 except Exception as error:  # An incompatible lance-namespace can fail during import.
     lance = None
     np = None
@@ -73,6 +76,7 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
                 )
 
     def test_strict_prewarm_restart_query_and_invalidate(self):
+        from benchmark_lib import aggregate_cache_metrics, cache_metrics_delta
         from cache_inspect import invalidation_errors, snapshot_l2_dir
 
         with tempfile.TemporaryDirectory(prefix="lance-cache-integration-") as temp_dir:
@@ -110,6 +114,9 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
             first = snapshot_l2_dir(l2_dir)
             self.assertEqual(first["cache_entry_count"], 4)
             self.assertEqual(first["namespace_count"], 1)
+            self.assertEqual(
+                session.index_cache_stats()["distributed"]["l2_writes_total"], 4
+            )
 
             del dataset, session
             gc.collect()
@@ -124,6 +131,7 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
             second = snapshot_l2_dir(l2_dir)
             self.assertEqual(second["cache_entry_count"], first["cache_entry_count"])
 
+            before = restarted_session.index_cache_stats()
             result = restarted.to_table(
                 columns=["id", "_distance"],
                 nearest={
@@ -138,6 +146,12 @@ class LanceDistributedCacheIntegrationTest(unittest.TestCase):
             returned_ids = result["id"].to_numpy()
             recall = len(set(exact_ids) & set(returned_ids)) / 10
             self.assertGreaterEqual(recall, 0.5)
+            after = restarted_session.index_cache_stats()
+            metrics = aggregate_cache_metrics([cache_metrics_delta(before, after)])
+            self.assertGreater(metrics["l2_hits"], 0)
+            self.assertEqual(metrics["l2_hit_ratio"], 1.0)
+            self.assertEqual(metrics["l1_partition_hit_ratio"], 0.0)
+            self.assertEqual(metrics["l2_writes"], 0)
             uncached = lance.dataset(
                 dataset_uri, session=lance.Session(index_cache_size_bytes=0)
             ).to_table(

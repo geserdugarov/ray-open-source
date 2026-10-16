@@ -46,10 +46,12 @@ The implementation and its documentation establish these benchmark contracts:
 
   The benchmark reports aggregate entry counts and bytes. It does not infer a
   partition ID from an opaque filename.
-- The Rust backend has L2 counters, but commit `bf6fa8d75` does not expose them
-  through Python. Python exposes `Session.size_bytes()` for the in-memory
-  footprint and `dataset.io_stats_snapshot()` for source reads. The benchmark
-  records source byte/operation deltas plus read-only L2 filesystem snapshots.
+- This benchmark also requires the cache-counter changes in the sibling Lance
+  checkout. `Session.index_cache_stats()` exposes cumulative overall hits and
+  misses for QuickCache and Moka, plus separate metadata-L1, partition-L1, and
+  L2 counters for the distributed backend. Rebuild and redeploy the Lance wheel
+  before running this version of the benchmark. Commit `bf6fa8d75` alone does
+  not expose these counters through Python.
 - That commit does not expose Python `compute_partition_ids` or
   `search_partitions` methods. This benchmark consequently measures ordinary
   full Lance queries in replicated actors. It does not pretend to benchmark a
@@ -89,6 +91,33 @@ Ordered result row IDs must match across all scenarios and phases; validation
 runs after each query's latency timer. Actor and driver wall times include that
 validation work.
 
+Console output and `summary.csv` include cache hits, misses, and hit ratios for
+each measured phase and `k`. `events.jsonl` preserves each actor's cumulative
+before/after snapshots and counter deltas, including prewarm. Snapshots and cache
+maintenance run outside the query and throughput timers. Ratios use summed
+counts across actors, `hits / (hits + misses)`, excluding earlier phases;
+`analyze_comparison.py` pools the counts across trials in `comparison.csv`.
+
+- `index_cache_hit_ratio` includes hits served by either cache level. For the
+  memory-only baseline, `l1_hit_ratio` is the same ratio and works with either
+  QuickCache or Moka. The session's separate file-metadata cache is outside
+  these index-cache counters.
+- `l1_partition_hit_ratio` measures decoded-partition reuse. A disabled
+  partition L1 records misses; `l1_metadata_hit_ratio` reports index metadata
+  separately. `l1_hit_ratio` combines these two L1 populations.
+- `l2_hit_ratio` is conditional on partition lookups that miss L1. Only a
+  successful decode counts as an L2 hit; missing, corrupt, unreadable, and
+  tombstoned entries count as misses. L2 bytes, writes, and error counters are
+  reported alongside the hit counts.
+- Internal L1 rechecks count once per logical lookup. A coalesced request
+  satisfied from L1 after another loader finishes counts as an L1 hit. Strict
+  prewarm's persistence-validation probes do not count as lookup hits.
+- Ratios with no lookups, and counters unavailable for a backend, are `n/a`
+  in console output, empty in CSV, and `null` in JSON. A memory-only cache has
+  no L2 ratio. These are lookup ratios, not byte-weighted ratios or physical
+  disk/page-cache hit ratios. Historical artifacts lack these counters and
+  cannot provide retrospective hit ratios.
+
 ## Environment
 
 Use a virtual environment. The benchmark requires a pylance wheel built from
@@ -120,6 +149,7 @@ import lance
 
 print(lance.__version__)
 print(inspect.signature(lance.Session.with_distributed_cache))
+print(lance.Session().index_cache_stats())
 print(inspect.signature(lance.LanceDataset.prewarm_index))
 print(inspect.signature(lance.Session.invalidate_index_cache))
 PY

@@ -53,7 +53,10 @@ class ClusterScriptsTest(unittest.TestCase):
         self.pylance = wheelhouse / "pylance-12.0.0-py3-none-any.whl"
         with zipfile.ZipFile(self.pylance, "w") as wheel:
             wheel.writestr("lance/dataset.py", "def prewarm_index(partition_ids): ...")
-            wheel.writestr("lance/lance/__init__.pyi", "l1_partition_capacity_bytes")
+            wheel.writestr(
+                "lance/lance/__init__.pyi",
+                "l1_partition_capacity_bytes index_cache_stats",
+            )
         self.ray = wheelhouse / "ray-2.58.0-py3-none-any.whl"
         self.ray.touch()
         config = self.root / "cluster.env"
@@ -314,7 +317,7 @@ class ClusterScriptsTest(unittest.TestCase):
                     )
                     wheel.writestr(
                         prefix + "lance/lance/__init__.pyi",
-                        "l1_partition_capacity_bytes",
+                        "l1_partition_capacity_bytes index_cache_stats",
                     )
                 result = self.run_script(
                     INFRA / "verify_wheelhouse.sh", str(self.pylance.parent)
@@ -332,6 +335,17 @@ class ClusterScriptsTest(unittest.TestCase):
         self.assertIn(str(self.pylance), result.stderr)
         self.assertIn("LANCE_WHEEL", result.stderr)
         self.assertNotIn("caution: filename not matched", result.stderr)
+
+    def test_verifier_rejects_wheel_without_cache_counters(self):
+        with zipfile.ZipFile(self.pylance, "w") as wheel:
+            wheel.writestr("lance/dataset.py", "partition_ids")
+            wheel.writestr("lance/lance/__init__.pyi", "l1_partition_capacity_bytes")
+        result = self.run_script(
+            INFRA / "verify_wheelhouse.sh", "--lance-wheel", str(self.pylance)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Session.index_cache_stats", result.stderr)
+        self.assertIn("Rebuild Lance", result.stderr)
 
     def test_verifier_rejects_ambiguous_module_paths(self):
         with zipfile.ZipFile(self.pylance, "a") as wheel:
